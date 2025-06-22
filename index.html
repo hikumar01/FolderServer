@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Drag & Drop Folder Upload (Chrome Only)</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; }
+    #drop-area {
+      border: 2px dashed #ccc;
+      border-radius: 10px;
+      width: 80%;
+      height: 30vh;
+      margin: 5px auto;
+      padding: 2px;
+      background: #f9f9f9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #drop-area.hover { background: #e9e9e9; }
+    #clearButton {
+      margin: 20px auto 20px auto;
+      display: block;
+      align-items: center;
+    }
+    #fieldsetSection {
+      border: 1px solid #4a4a4a;
+      border-radius: 8px;
+      width: 80%;
+      margin: 5px auto;
+      align-self: center;
+      display: none;
+    }
+    #success, #failure, #progress, #status, #skipped {
+      margin: 0px auto;
+      max-height: 200px;
+      overflow-y: auto;
+      border-radius: 4px;
+      display: none;
+    }
+    #success, #failure, #progress, #skipped {
+      text-align: left;
+    }
+    #status { color: blue; text-align: center; }
+    #progress { color: orange; }
+    #success { color: green; }
+    #failure { color: red; }
+    #skipped { color: DodgerBlue; }
+    #file-list { text-align: left; }
+    #overlay-message {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: white;
+      border: 2px solid #ccc;
+      border-radius: 10px;
+      padding: 20px 30px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+      z-index: 9999;
+      display: none;
+      font-size: 16px;
+      font-weight: bold;
+      max-width: 80%;
+      text-align: center;
+    }
+    table {
+      width: 80%;
+      margin: 10px auto;
+      border-collapse: collapse;
+      border: 1px solid #ccc;
+    }
+    th, td {
+      border: 1px solid #aaa;
+      padding: 8px 12px;
+      text-align: left;
+    }
+    th {
+      background-color: #f2f2f2;
+    }
+    tr:nth-child(even) {
+      background-color: #f9f9f9;
+    }
+    tr:nth-child(odd) {
+      background-color: #ffffff;
+    }
+    td:nth-child(even), th:nth-child(even) {
+      text-align: right;
+    }
+    td:nth-child(odd), th:nth-child(odd) {
+      text-align: left;
+    }
+    tr:hover {
+      background-color: #e6f7ff;
+    }
+  </style>
+  <link type="image/png" sizes="16x16" rel="icon" href="favicon.png">
+</head>
+<body>
+
+<h2>Drag & Drop Folder Upload (Chrome Only)</h2>
+<div id="drop-area">
+  Drop folder or files here
+</div>
+
+<button id="clearButton" onclick="clearReport()">Clear Report / New Upload</button>
+<fieldset id="fieldsetSection"> 
+  <legend>Status</legend>
+  <div id="status" ></div>
+</fieldset>
+<fieldset id="fieldsetSection"> 
+  <legend>Progress</legend>
+  <div id="progress" ></div>
+</fieldset>
+<fieldset id="fieldsetSection"> 
+  <legend>Success</legend>
+  <div id="success" ></div>
+</fieldset>
+<fieldset id="fieldsetSection"> 
+  <legend>Already Present</legend>
+  <div id="skipped" ></div>
+</fieldset>
+<fieldset id="fieldsetSection"> 
+  <legend>Failure</legend>
+  <div id="failure" ></div>
+</fieldset>
+<div id="overlay-message" ></div>
+<div id="file-list" ></div>
+
+<script>
+  // Chrome check
+  const isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
+  if (!isChrome) {
+    alert("⚠️ This uploader works only in Chrome-based browsers. Please switch to Chrome or Edge.");
+    document.body.innerHTML = "<h3 style='color:red;text-align:center'>Unsupported Browser</h3><p style='text-align:center'>This feature is only supported in Chrome-based browsers (e.g., Chrome, Edge).</p>";
+    throw new Error("Unsupported browser");
+  }
+
+  let totalFiles = 0;
+  let completedFiles = 0;
+  let failedFiles = 0;
+  let totalBytes = 0;
+  let uploadedBytes = 0;
+
+  const MAX_CONCURRENT_UPLOADS = 5;
+  const uploadQueue = [];
+  let activeUploads = 0;
+
+  const successLogs = [];
+  const failureLogs = [];
+  const skippedLogs = [];
+  const fileProgressElements = {};
+
+  const dropArea = document.getElementById("drop-area");
+  window.addEventListener("dragover", e => e.preventDefault(), false);
+  window.addEventListener("drop", e => e.preventDefault(), false);
+  window.addEventListener('DOMContentLoaded', () => {
+    listFiles();
+  });
+
+  dropArea.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    dropArea.classList.add("hover");
+  });
+
+  dropArea.addEventListener("dragleave", () => {
+    dropArea.classList.remove("hover");
+  });
+
+  dropArea.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropArea.classList.remove("hover");
+
+    const items = e.dataTransfer.items;
+    if (!items) return;
+
+    const entries = [];
+    for (const item of items) {
+      const entry = item.webkitGetAsEntry?.();
+      if (entry) entries.push(entry);
+    }
+
+    clearReport();
+    dropArea.style.display = "none";
+    ["status", "progress"].forEach(id => {
+      const el = document.getElementById(id);
+      const fs = el.closest("fieldset");
+      el.style.display = "block";
+      if (fs) fs.style.display = "block";
+    });
+    countFilesAndBytes(entries).then(({ count, size }) => {
+      totalFiles = count;
+      totalBytes = size;
+      for (const entry of entries) {
+        traverseFileTree(entry);
+      }
+    });
+    listFiles();
+  });
+
+  function countFilesAndBytes(entries) {
+    const promises = entries.map(entry => {
+      return new Promise(resolve => {
+        if (entry.isFile) {
+          entry.file(file => resolve({ count: 1, size: file.size }));
+        } else if (entry.isDirectory) {
+          const reader = entry.createReader();
+          reader.readEntries(subEntries => {
+            countFilesAndBytes(subEntries).then(resolve);
+          });
+        } else {
+          resolve({ count: 0, size: 0 });
+        }
+      });
+    });
+
+    return Promise.all(promises).then(results => {
+      return results.reduce((acc, r) => ({
+        count: acc.count + r.count,
+        size: acc.size + r.size
+      }), { count: 0, size: 0 });
+    });
+  }
+
+  function traverseFileTree(item, path = "") {
+    if (item.isFile) {
+      item.file(file => {
+        uploadQueue.push({ file, path: path + file.name });
+        processQueue();
+      });
+    } else if (item.isDirectory) {
+      const dirReader = item.createReader();
+      dirReader.readEntries(entries => {
+        for (const entry of entries) {
+          traverseFileTree(entry, path + item.name + "/");
+        }
+      });
+    }
+  }
+
+  function processQueue() {
+    while (activeUploads < MAX_CONCURRENT_UPLOADS && uploadQueue.length > 0) {
+      const { file, path } = uploadQueue.shift();
+      activeUploads++;
+      uploadFile(file, path);
+    }
+  }
+
+  function formatBytes(bytes) {
+    if (bytes === 0) return '0 bytes';
+    const k = 1024;
+    const sizes = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const num = bytes / Math.pow(k, i);
+    return `${num.toFixed(i === 0 ? 0 : 2)} ${sizes[i]}`;
+  }
+
+  function updateOverallStatus() {
+    const percent = totalBytes > 0 ? ((uploadedBytes / totalBytes) * 100).toFixed(2) : 0;
+    document.getElementById("status").textContent =
+      `Total: ${completedFiles}/${totalFiles} (${percent}%) | Uploaded: ${formatBytes(uploadedBytes)} / ${formatBytes(totalBytes)} | Failed: ${failedFiles}`;
+  }
+
+  function uploadFile(file, relativePath) {
+    const progressContainer = document.getElementById("progress");
+    const progressLine = document.createElement("div");
+    progressLine.textContent = `${relativePath}: 0%`;
+    progressContainer.appendChild(progressLine);
+
+    fileProgressElements[relativePath] = {
+      element: progressLine,
+      lastLoaded: 0
+    };
+
+    const formData = new FormData();
+    formData.append("file", file, relativePath);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/");
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percent = Math.round((e.loaded / e.total) * 100);
+        const fileState = fileProgressElements[relativePath];
+
+        fileState.element.textContent = `${relativePath}: ${percent}% (${formatBytes(e.loaded)} / ${formatBytes(e.total)})`;
+        updateOverallStatus();
+      }
+    };
+
+    xhr.onload = () => {
+      completedFiles++;
+      activeUploads--;
+      uploadedBytes += file.size;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const responseLines = xhr.responseText.trim().split("\n");
+        for (const line of responseLines) {
+          if (line.startsWith("[SKIPPED]")) {
+            skippedLogs.push(relativePath);
+            updateDisplayLogs("skipped", skippedLogs);
+          } else {
+            successLogs.push(relativePath);
+            updateDisplayLogs("success", successLogs);
+          }
+        }
+      } else {
+        failedFiles++;
+        failureLogs.push(`${relativePath} → HTTP ${xhr.status}`);
+        updateDisplayLogs("failure", failureLogs);
+      }
+
+      document.getElementById("progress").removeChild(fileProgressElements[relativePath].element);
+      delete fileProgressElements[relativePath];
+      updateOverallStatus();
+
+      if (completedFiles === totalFiles) {
+        const dropArea = document.getElementById("drop-area");
+        dropArea.style.display = "flex";
+        const pl = document.getElementById("progress");
+        pl.style.display = "none";
+        const fs = pl.closest("fieldset");
+        if (fs) fs.style.display = "none";
+        showFinalOverlay();
+      } else {
+        processQueue();
+      }
+    };
+
+    xhr.onerror = () => {
+      completedFiles++;
+      activeUploads--;
+      failedFiles++;
+      failureLogs.push(`${relativePath} → Upload failed`);
+      updateDisplayLogs("failure", failureLogs);
+      document.getElementById("progress").removeChild(fileProgressElements[relativePath].element);
+      delete fileProgressElements[relativePath];
+      updateOverallStatus();
+      processQueue();
+    };
+
+    xhr.send(formData);
+  }
+
+  function updateDisplayLogs(containerId, logArray) {
+    const container = document.getElementById(containerId);
+    const fieldset = container.closest("fieldset");
+    container.innerHTML = "";
+    if (logArray.length === 0) {
+      container.style.display = "none";
+      if (fieldset) fieldset.style.display = "none";
+      return;
+    }
+    container.style.display = "block";
+    if (fieldset) fieldset.style.display = "block";
+    for (const line of logArray) {
+      const div = document.createElement("div");
+      div.textContent = line;
+      container.appendChild(div);
+    }
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function listFiles() {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/list', true);
+
+    xhr.onload = function () {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        console.log('file: ', xhr.responseText);
+        const items = JSON.parse(xhr.responseText);
+        const container = document.getElementById('file-list');
+        container.innerHTML = '';
+
+        const table = document.createElement('table');
+        const headerRow = document.createElement('tr');
+        headerRow.innerHTML = `
+          <th>File/Directory</th>
+          <th>Size</th>
+        `;
+        table.appendChild(headerRow);
+
+        items.forEach(item => {
+          // const div = document.createElement('div');
+          const isDir = item.path.endsWith("/");
+          // print(`Listing: ${item.path} (isDir: ${isDir})`);
+          // div.textContent = `${item.path}${isDir ? '' : ' — ' + formatBytes(item.size)}`;
+          // container.appendChild(div);
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${item.path}</td>
+            <td>${isDir ? "" : formatBytes(item.size)}</td>
+          `;
+          table.appendChild(row);
+        });
+        container.appendChild(table);
+      } else {
+        alert('Failed to fetch file list: HTTP ' + xhr.status);
+      }
+    };
+
+    xhr.onerror = function () {
+      alert('Failed to fetch file list: Network error');
+    };
+
+    xhr.send();
+  }
+
+  function showFinalOverlay() {
+    const overlay = document.getElementById("overlay-message");
+    overlay.textContent = failedFiles > 0
+      ? `⚠️ Upload completed with errors. ${failedFiles} of ${totalFiles} file(s) failed.`
+      : `✅ Upload completed successfully. All ${totalFiles} file(s) uploaded.`;
+    overlay.style.backgroundColor = failedFiles > 0 ? "#ffecec" : "#e6ffe6";
+    overlay.style.color = failedFiles > 0 ? "red" : "green";
+    overlay.style.display = "block";
+    listFiles();
+    setTimeout(() => {
+      overlay.style.display = "none";
+    }, 5000);
+  }
+
+  function clearReport() {
+    completedFiles = 0;
+    failedFiles = 0;
+    totalFiles = 0;
+    uploadedBytes = 0;
+    totalBytes = 0;
+    activeUploads = 0;
+    uploadQueue.length = 0;
+    successLogs.length = 0;
+    failureLogs.length = 0;
+    skippedLogs.length = 0;
+    Object.keys(fileProgressElements).forEach(key => delete fileProgressElements[key]);
+
+    ["status", "progress", "success", "failure", "skipped"].forEach(id => {
+      const el = document.getElementById(id);
+      el.textContent = "";
+      el.innerHTML = "";
+      el.style.display = "none";
+      const fs = el.closest("fieldset");
+      if (fs) fs.style.display = "none";
+    });
+  }
+</script>
+
+</body>
+</html>
