@@ -98,7 +98,7 @@
 </head>
 <body>
 
-<h2>Drag & Drop Folder Upload (Chrome Only)</h2>
+<h2>Drag & Drop Folder Upload (Chrome Only) - Supports Large Files</h2>
 <div id="drop-area">
   Drop folder or files here
 </div>
@@ -143,8 +143,6 @@
   let uploadedBytes = 0;
 
   const MAX_CONCURRENT_UPLOADS = 5;
-  const MAX_HTTP_SERVER_SIZE = 2 * 1024 * 1024; // 2MB - matches server limit
-  const FLASK_PORT = 8081; // Large file server port
   const uploadQueue = [];
   let activeUploads = 0;
 
@@ -266,7 +264,8 @@
   function uploadFile(file, relativePath) {
     const progressContainer = document.getElementById("progress");
     const progressLine = document.createElement("div");
-    progressLine.textContent = `${relativePath}: 0%`;
+    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+    progressLine.textContent = `${relativePath} (${fileSizeMB} MB): 0%`;
     progressContainer.appendChild(progressLine);
 
     fileProgressElements[relativePath] = {
@@ -278,16 +277,8 @@
     formData.append("file", file, relativePath);
     formData.append("path", relativePath);
 
-    // Determine which server to use based on file size
-    const useFlask = file.size >= MAX_HTTP_SERVER_SIZE;
-    const uploadUrl = useFlask ? `http://${window.location.hostname}:${FLASK_PORT}/large-upload` : "/";
-
-    if (useFlask) {
-      progressLine.textContent = `${relativePath}: 0% (Large file - using fallback server)`;
-    }
-
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", uploadUrl);
+    xhr.open("POST", "/");
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
@@ -303,43 +294,40 @@
       completedFiles++;
       activeUploads--;
       uploadedBytes += file.size;
+      
       if (xhr.status >= 200 && xhr.status < 300) {
-        // Check if response is JSON (Flask) or plain text (http.server)
-        const contentType = xhr.getResponseHeader("Content-Type");
-        
-        if (contentType && contentType.includes("application/json")) {
-          // Flask response
-          try {
-            const response = JSON.parse(xhr.responseText);
-            if (response.status === 'skipped') {
-              skippedLogs.push(relativePath);
-              updateDisplayLogs("skipped", skippedLogs);
-            } else {
-              successLogs.push(relativePath);
-              updateDisplayLogs("success", successLogs);
-            }
-          } catch (e) {
-            console.error("Failed to parse JSON response:", e);
+        try {
+          const response = JSON.parse(xhr.responseText);
+          if (response.status === 'skipped') {
+            skippedLogs.push(relativePath);
+            updateDisplayLogs("skipped", skippedLogs);
+          } else if (response.status === 'success') {
+            successLogs.push(relativePath);
+            updateDisplayLogs("success", successLogs);
+          } else {
+            // Unknown status
             failedFiles++;
-            failureLogs.push(`${relativePath} → Parse error`);
+            failureLogs.push(`${relativePath} → Unknown status: ${response.status}`);
             updateDisplayLogs("failure", failureLogs);
           }
-        } else {
-          // http.server response (plain text)
-          const responseLines = xhr.responseText.trim().split("\n");
-          for (const line of responseLines) {
-            if (line.startsWith("[SKIPPED]")) {
-              skippedLogs.push(relativePath);
-              updateDisplayLogs("skipped", skippedLogs);
-            } else {
-              successLogs.push(relativePath);
-              updateDisplayLogs("success", successLogs);
-            }
-          }
+        } catch (e) {
+          console.error("Failed to parse JSON response:", e, xhr.responseText);
+          failedFiles++;
+          failureLogs.push(`${relativePath} → Parse error`);
+          updateDisplayLogs("failure", failureLogs);
         }
       } else {
         failedFiles++;
-        failureLogs.push(`${relativePath} → HTTP ${xhr.status}`);
+        let errorMsg = `${relativePath} → HTTP ${xhr.status}`;
+        try {
+          const errorResponse = JSON.parse(xhr.responseText);
+          if (errorResponse.error) {
+            errorMsg += `: ${errorResponse.error}`;
+          }
+        } catch (e) {
+          // Non-JSON error response
+        }
+        failureLogs.push(errorMsg);
         updateDisplayLogs("failure", failureLogs);
       }
 

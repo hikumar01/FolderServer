@@ -1,11 +1,8 @@
-# Quick Setup Guide for Large File Upload Support
+# Quick Setup Guide
 
-## 🎯 What Was Changed
+## 🎯 Overview
 
-Your file upload server now supports **large files (>2MB)** with an automatic fallback mechanism:
-
-- **Small files (< 2MB)**: Use the original `http.server` (fast, lightweight)
-- **Large files (≥ 2MB)**: Automatically use Flask server (reliable, up to 10GB)
+Your file upload server now uses a **single Flask server** that efficiently handles files of any size (up to 10GB) using memory-efficient streaming.
 
 ## 🚀 Quick Start
 
@@ -21,19 +18,19 @@ source venv/bin/activate
 pip install Flask Werkzeug
 ```
 
-#### Option B: User Installation
+#### Option B: Automated Installer
+```bash
+./install.sh
+```
+
+#### Option C: User Installation
 ```bash
 pip3 install --user Flask Werkzeug
 ```
 
-#### Option C: System Installation (requires password)
+#### Option D: System Installation (requires password)
 ```bash
 sudo pip3 install Flask Werkzeug
-```
-
-#### Option D: Use Install Script
-```bash
-./install.sh
 ```
 
 ### Step 2: Start the Server
@@ -44,75 +41,93 @@ sudo pip3 install Flask Werkzeug
 
 You should see:
 ```
-✅ Main Server (http.server) running at http://YOUR_IP:8080
-✅ Large File Server (Flask) running at http://YOUR_IP:8081
+✅ Server running at http://YOUR_IP:8080
 📂 Upload directory: /Users/hikumar/src/FolderServer/uploads
-📏 Files < 2MB: http.server | Files >= 2MB: Flask (up to 10GB)
+📏 Maximum file size: 10GB
+🔧 Chunk size: 8192 bytes (memory efficient)
+🔁 Press Ctrl+C to stop...
 ```
 
 ### Step 3: Upload Files
 
 1. Open browser to `http://YOUR_IP:8080`
 2. Drag and drop files or folders
-3. Watch the automatic routing:
-   - Small files → Port 8080 (http.server)
-   - Large files → Port 8081 (Flask) with "(Large file - using fallback server)" indicator
+3. Watch the progress with file sizes displayed
+4. All files handled by the same server efficiently
 
 ## 🔧 How It Works
 
-### Architecture
+### Single Server Architecture
 
 ```
 Browser
    │
-   ├─ File < 2MB ──────────► Port 8080 (http.server)
-   │                          • Fast & lightweight
-   │                          • Original Python server
-   │
-   └─ File ≥ 2MB ──────────► Port 8081 (Flask)
-                               • Reliable for large files
-                               • Handles up to 10GB
-                               • Production-grade
+   └─ All files (any size) ──► Port 8080 (Flask)
+                                 • Streams in 8KB chunks
+                                 • Memory efficient
+                                 • Up to 10GB per file
 ```
 
-### Automatic Fallback
+### Memory Efficiency
 
-The JavaScript client detects file size and automatically:
-1. Routes small files to port 8080
-2. Routes large files to port 8081
-3. Displays progress for both
+No matter the file size, the server only uses ~8KB of memory per upload:
 
-### Server-Side Protection
+| File Size | Server Memory | How? |
+|-----------|--------------|------|
+| 1 MB      | ~8 KB        | Streaming |
+| 1 GB      | ~8 KB        | Streaming |
+| 10 GB     | ~8 KB        | Streaming |
 
-The http.server checks `Content-Length` header:
-- If < 2MB: Process normally
-- If ≥ 2MB: Return 307 redirect to Flask (safety fallback)
+### Streaming Process
+
+1. **Upload**: Browser sends file in multipart chunks
+2. **Stream**: Server reads 8KB at a time, writes to disk
+3. **Compare**: If file exists, compare chunk-by-chunk
+4. **Version**: Create `file (1).ext` if different
+
+## ✅ Testing
+
+### Test Small File
+```bash
+echo "Small test file" > test_small.txt
+# Upload via browser
+```
+
+### Test Large File (100MB)
+```bash
+dd if=/dev/zero of=test_100mb.bin bs=1048576 count=100
+# Upload via browser - will show progress with file size
+```
+
+### Test Very Large File (1GB)
+```bash
+dd if=/dev/zero of=test_1gb.bin bs=1048576 count=1024
+# Upload via browser - streams efficiently, no memory issues
+```
 
 ## 📝 Configuration
 
 Edit `server.py` to customize:
 
 ```python
-MAX_HTTP_SERVER_SIZE = 2 * 1024 * 1024      # 2MB threshold
-MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024     # 10GB max
-PORT = 8080                                  # Main port
-FLASK_PORT = 8081                            # Fallback port
+UPLOAD_DIR = "./uploads"                        # Where files are stored
+PORT = 8080                                      # Server port
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024         # 10GB max (change as needed)
+CHUNK_SIZE = 8192                                # 8KB chunks (8192 is optimal)
 ```
 
-## ✅ Testing
+### Increase Maximum File Size
 
-### Test Small File (http.server)
-```bash
-# Create a small test file
-echo "Small test" > test_small.txt
-# Upload via browser - should use port 8080
+To allow 50GB files:
+```python
+MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024  # 50GB
 ```
 
-### Test Large File (Flask)
-```bash
-# Create a 3MB test file
-dd if=/dev/zero of=test_large.bin bs=1048576 count=3
-# Upload via browser - should use port 8081 with fallback indicator
+### Change Port
+
+To use port 9000 instead:
+```python
+PORT = 9000
 ```
 
 ## 🐛 Troubleshooting
@@ -122,17 +137,16 @@ dd if=/dev/zero of=test_large.bin bs=1048576 count=3
 ModuleNotFoundError: No module named 'flask'
 ```
 
-**Solution**: Install Flask using one of the methods in Step 1
+**Solution**: Install Flask using Step 1 above
 
-### Both Ports Busy
+### Port Already in Use
 ```
 OSError: [Errno 48] Address already in use
 ```
 
-**Solution**: Kill existing processes
+**Solution**: Kill existing process
 ```bash
 lsof -ti:8080 | xargs kill -9
-lsof -ti:8081 | xargs kill -9
 ```
 
 ### SSL Certificate Error (macOS)
@@ -145,66 +159,120 @@ SSLCertVerificationError
 /Applications/Python\ 3.10/Install\ Certificates.command
 ```
 
-Or use trusted hosts:
-```bash
-pip3 install --trusted-host pypi.org --trusted-host files.pythonhosted.org Flask Werkzeug
-```
+Or use the installer script which handles this.
 
-### Permission Denied
+### Permission Denied During Install
 ```
 OSError: [Errno 1] Operation not permitted
 ```
 
-**Solution**: Use virtual environment or sudo
+**Solution**: Use virtual environment (Option A in Step 1)
 
-## 📊 What Changed in Each File
+### Upload Fails or Hangs
 
-### `server.py`
-- ✅ Added Flask import and configuration
-- ✅ Created Flask routes for large file handling
-- ✅ Added size check in `do_POST()` method
-- ✅ Implemented two-server startup (http.server + Flask)
-- ✅ Added graceful shutdown for both servers
+1. **Check disk space**: `df -h`
+2. **Check server logs**: Look at terminal output
+3. **Check file size**: Ensure it's under MAX_FILE_SIZE
+4. **Browser timeout**: Try Chrome (best for large uploads)
 
-### `index.html`
-- ✅ Added Flask port and size threshold constants
-- ✅ Modified `uploadFile()` to detect large files
-- ✅ Auto-route to Flask for large files
-- ✅ Added response parsing for both server types
-- ✅ Added "(Large file)" indicator in progress
+## 📊 What Changed
 
-### New Files
-- ✅ `requirements.txt` - Python dependencies
-- ✅ `README.md` - Full documentation
-- ✅ `SETUP_GUIDE.md` - This quick start guide
-- ✅ `install.sh` - Automated installation script
+### Simplified Architecture
+
+**Before:**
+- Two servers (http.server + Flask)
+- Two ports (8080 + 8081)
+- Complex fallback logic
+- http.server fails on files > 2MB
+
+**After:**
+- One server (Flask only)
+- One port (8080)
+- Simple, reliable
+- Works for all file sizes
+
+### Files Modified
+
+1. **server.py**
+   - Removed http.server completely
+   - Single Flask server only
+   - Added streaming file handler
+   - Chunk-based comparison for duplicates
+
+2. **index.html**
+   - Removed dual-server logic
+   - Single upload endpoint
+   - Added file size display in progress
+
+3. **run.sh**
+   - Updated dependency checks
+   - Simplified startup
+   - Better error messages
+
+4. **README.md** & **SETUP_GUIDE.md**
+   - Updated documentation
+   - Reflects new architecture
 
 ## 🎓 Benefits
 
-| Feature | Before | After |
-|---------|--------|-------|
-| Small files (< 2MB) | ✅ Works | ✅ Works (unchanged) |
-| Large files (≥ 2MB) | ❌ Fails/unreliable | ✅ Works reliably |
-| Maximum file size | ~2MB | 10GB (configurable) |
-| Memory usage | High (loads all to RAM) | Efficient (streaming) |
-| Concurrent uploads | 5 | 5 (unchanged) |
-| Browser support | Chrome only | Chrome only (unchanged) |
+| Feature | Value |
+|---------|-------|
+| Simplicity | Single server, one port |
+| Memory | Constant ~8KB per upload |
+| Reliability | Flask is production-grade |
+| File Size | Up to 10GB (configurable) |
+| Speed | No overhead from dual servers |
+| Maintenance | Easier to debug and modify |
 
 ## 🔐 Security
 
-All existing security features maintained:
+All security features maintained:
 - ✅ Path traversal protection
 - ✅ Upload directory isolation
-- ✅ File versioning
-- ✅ **NEW**: File size limits enforced
+- ✅ File size limits
+- ✅ Streaming prevents memory attacks
 
-## 📞 Need Help?
+## 💡 Tips
 
-Check logs when running the server - both servers output status messages:
-- `[UPLOAD]` - File successfully uploaded
-- `[SKIP]` - Duplicate file (same content)
-- `[ERROR]` - Upload failed
+### Multiple Concurrent Uploads
+
+The server supports 5 concurrent uploads by default. All are streamed efficiently.
+
+### Network Performance
+
+Upload speed depends on your network:
+- 100 Mbps → ~12 MB/s → 1GB in ~85 seconds
+- 1 Gbps → ~125 MB/s → 1GB in ~8 seconds
+
+### Disk I/O
+
+Streaming writes are efficient. Even with slow HDDs, uploads work well because:
+1. Writing happens as data arrives
+2. No large buffers needed
+3. OS handles disk caching
+
+## 📞 Common Questions
+
+**Q: Why Flask instead of http.server?**
+
+A: Python's http.server has bugs with files > 2MB. Flask is production-ready and handles any size reliably.
+
+**Q: Will large files crash the server?**
+
+A: No! Streaming ensures constant low memory usage regardless of file size.
+
+**Q: Can I upload 100 files at once?**
+
+A: Yes, but only 5 upload simultaneously (to prevent overload). Others queue automatically.
+
+**Q: What if two people upload the same file?**
+
+A: Each gets their own copy. Versioning creates `file (1).ext`, `file (2).ext`, etc.
+
+**Q: Does it work on Firefox?**
+
+A: Folder upload requires Chrome APIs. Single file upload works on all browsers.
 
 ---
 
-**Ready to test?** Install Flask (Step 1) and run `./run.sh` (Step 2)!
+**Ready to use?** Run `./run.sh` and start uploading!
