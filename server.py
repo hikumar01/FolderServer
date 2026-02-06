@@ -6,15 +6,113 @@ import signal
 import sys
 import hashlib
 import json
+from werkzeug.utils import secure_filename
+from flask import Flask, request, jsonify, send_from_directory
+from werkzeug.serving import make_server
 
 UPLOAD_DIR = "./uploads"
 PORT = 8080
+FLASK_PORT = 8081  # Fallback server for large files
+MAX_HTTP_SERVER_SIZE = 2 * 1024 * 1024  # 2MB limit for http.server
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB max file size
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+# Flask app for large file uploads
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+flask_server = None
+
+@app.route('/large-upload', methods=['POST'])
+def large_upload():
+    """Handle large file uploads via Flask"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    # Get the relative path from form data
+    relative_path = request.form.get('path', file.filename)
+    
+    # Security: prevent path traversal
+    if relative_path.startswith("/") or ".." in relative_path:
+        return jsonify({'error': 'Unsafe path'}), 400
+    
+    filepath = os.path.abspath(os.path.join(UPLOAD_DIR, relative_path))
+    if not filepath.startswith(os.path.abspath(UPLOAD_DIR)):
+        return jsonify({'error': 'Outside upload dir'}), 400
+    
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    
+    # Check if file exists and handle versioning
+    if os.path.exists(filepath):
+        # Check if content is the same
+        temp_path = filepath + ".tmp"
+        file.save(temp_path)
+        
+        with open(temp_path, 'rb') as new_file:
+            new_data = new_file.read()
+        
+        with open(filepath, 'rb') as existing_file:
+            existing_data = existing_file.read()
+        
+        if existing_data == new_data:
+            os.remove(temp_path)
+            print(f"[SKIP] Same content: {filepath}")
+            return jsonify({'status': 'skipped', 'path': relative_path}), 200
+        
+        os.remove(temp_path)
+        
+        # Create versioned filename
+        base, ext = os.path.splitext(filepath)
+        counter = 1
+        versioned_filepath = filepath
+        while os.path.exists(versioned_filepath):
+            versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
+            counter += 1
+        
+        file.seek(0)  # Reset file pointer
+        file.save(versioned_filepath)
+        print(f"[UPLOAD] New version created: {versioned_filepath}")
+        return jsonify({'status': 'success', 'path': os.path.basename(versioned_filepath)}), 200
+    else:
+        file.save(filepath)
+        print(f"[UPLOAD] New file: {filepath}")
+        return jsonify({'status': 'success', 'path': os.path.basename(filepath)}), 200
+
+@app.route('/list', methods=['GET'])
+def flask_list_files():
+    """List uploaded files - Flask version"""
+    uploads_abs = os.path.abspath(UPLOAD_DIR)
+    result = []
+    
+    try:
+        for entry in os.listdir(uploads_abs):
+            full_path = os.path.join(uploads_abs, entry)
+            if os.path.isdir(full_path):
+                result.append({
+                    "path": entry + "/",
+                    "size": 0
+                })
+            elif os.path.isfile(full_path):
+                result.append({
+                    "path": entry,
+                    "size": os.path.getsize(full_path)
+                })
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/')
+def flask_index():
+    """Serve the main page from Flask"""
+    return send_from_directory('.', 'index.html')
 
 class UploadHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -57,6 +155,23 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
 
         if content_length <= 0 or "boundary=" not in content_type:
             self.send_error(400, "Invalid POST request")
+            return
+
+        # Check if file is too large for http.server
+        if content_length > MAX_HTTP_SERVER_SIZE:
+            # Redirect to Flask server
+            self.send_response(307)  # Temporary Redirect
+            self.send_header('Location', f'http://{self.headers.get("Host").split(":")[0]}:{FLASK_PORT}/large-upload')
+            self.send_header('X-Large-File-Redirect', 'true')
+            self.end_headers()
+            # Still need to consume the body to prevent connection issues
+            # But we'll do it in chunks to avoid memory issues
+            bytes_consumed = 0
+            chunk_size = 8192
+            while bytes_consumed < content_length:
+                to_read = min(chunk_size, content_length - bytes_consumed)
+                self.rfile.read(to_read)
+                bytes_consumed += to_read
             return
 
         boundary = content_type.split("boundary=")[1].strip().encode()
@@ -136,30 +251,41 @@ class UploadHandler(http.server.SimpleHTTPRequestHandler):
         # print(f"[REQUEST] {self.client_address[0]} - {format % args}")
         pass
 
-# Setup and run the server
+# Setup and run the servers
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 httpd = ThreadedHTTPServer(("", PORT), UploadHandler)
+flask_server = make_server('', FLASK_PORT, app, threaded=True)
 
 def shutdown_server(signum=None, frame=None):
-    print("\n🔴 Shutting down server...")
+    print("\n🔴 Shutting down servers...")
     httpd.shutdown()
     httpd.server_close()
-    print("✅ Server stopped.")
+    flask_server.shutdown()
+    print("✅ Servers stopped.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, shutdown_server)
 signal.signal(signal.SIGTERM, shutdown_server)
 
-thread = threading.Thread(target=httpd.serve_forever)
-thread.daemon = True
-thread.start()
+# Start http.server thread
+http_thread = threading.Thread(target=httpd.serve_forever)
+http_thread.daemon = True
+http_thread.start()
+
+# Start Flask server thread
+flask_thread = threading.Thread(target=flask_server.serve_forever)
+flask_thread.daemon = True
+flask_thread.start()
 
 server_ip = sys.argv[1] if len(sys.argv) > 1 else "localhost"
-print(f"✅ Server running at http://{server_ip}:{PORT}")
+print(f"✅ Main Server (http.server) running at http://{server_ip}:{PORT}")
+print(f"✅ Large File Server (Flask) running at http://{server_ip}:{FLASK_PORT}")
 print(f"📂 Upload directory: {os.path.abspath(UPLOAD_DIR)}")
+print(f"📏 Files < 2MB: http.server | Files >= 2MB: Flask (up to 10GB)")
 print("🔁 Press Ctrl+C to stop...")
 
 try:
-    thread.join()
+    http_thread.join()
+    flask_thread.join()
 except KeyboardInterrupt:
     shutdown_server()
