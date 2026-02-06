@@ -143,6 +143,8 @@
   let uploadedBytes = 0;
 
   const MAX_CONCURRENT_UPLOADS = 5;
+  const MAX_HTTP_SERVER_SIZE = 2 * 1024 * 1024; // 2MB - matches server limit
+  const FLASK_PORT = 8081; // Large file server port
   const uploadQueue = [];
   let activeUploads = 0;
 
@@ -274,9 +276,18 @@
 
     const formData = new FormData();
     formData.append("file", file, relativePath);
+    formData.append("path", relativePath);
+
+    // Determine which server to use based on file size
+    const useFlask = file.size >= MAX_HTTP_SERVER_SIZE;
+    const uploadUrl = useFlask ? `http://${window.location.hostname}:${FLASK_PORT}/large-upload` : "/";
+
+    if (useFlask) {
+      progressLine.textContent = `${relativePath}: 0% (Large file - using fallback server)`;
+    }
 
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/");
+    xhr.open("POST", uploadUrl);
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
@@ -293,14 +304,37 @@
       activeUploads--;
       uploadedBytes += file.size;
       if (xhr.status >= 200 && xhr.status < 300) {
-        const responseLines = xhr.responseText.trim().split("\n");
-        for (const line of responseLines) {
-          if (line.startsWith("[SKIPPED]")) {
-            skippedLogs.push(relativePath);
-            updateDisplayLogs("skipped", skippedLogs);
-          } else {
-            successLogs.push(relativePath);
-            updateDisplayLogs("success", successLogs);
+        // Check if response is JSON (Flask) or plain text (http.server)
+        const contentType = xhr.getResponseHeader("Content-Type");
+        
+        if (contentType && contentType.includes("application/json")) {
+          // Flask response
+          try {
+            const response = JSON.parse(xhr.responseText);
+            if (response.status === 'skipped') {
+              skippedLogs.push(relativePath);
+              updateDisplayLogs("skipped", skippedLogs);
+            } else {
+              successLogs.push(relativePath);
+              updateDisplayLogs("success", successLogs);
+            }
+          } catch (e) {
+            console.error("Failed to parse JSON response:", e);
+            failedFiles++;
+            failureLogs.push(`${relativePath} → Parse error`);
+            updateDisplayLogs("failure", failureLogs);
+          }
+        } else {
+          // http.server response (plain text)
+          const responseLines = xhr.responseText.trim().split("\n");
+          for (const line of responseLines) {
+            if (line.startsWith("[SKIPPED]")) {
+              skippedLogs.push(relativePath);
+              updateDisplayLogs("skipped", skippedLogs);
+            } else {
+              successLogs.push(relativePath);
+              updateDisplayLogs("success", successLogs);
+            }
           }
         }
       } else {
