@@ -2,9 +2,9 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Drag & Drop Folder Upload (Chrome Only)</title>
+  <title>File Upload</title>
   <style>
-    body { font-family: sans-serif; text-align: center; }
+    body { font-family: sans-serif; text-align: center; padding: 20px; }
     #drop-area {
       border: 2px dashed #ccc;
       border-radius: 10px;
@@ -47,23 +47,6 @@
     #failure { color: red; }
     #skipped { color: DodgerBlue; }
     #file-list { text-align: left; }
-    #overlay-message {
-      position: fixed;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      background: white;
-      border: 2px solid #ccc;
-      border-radius: 10px;
-      padding: 20px 30px;
-      box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-      z-index: 9999;
-      display: none;
-      font-size: 16px;
-      font-weight: bold;
-      max-width: 80%;
-      text-align: center;
-    }
     table {
       width: 80%;
       margin: 10px auto;
@@ -98,9 +81,9 @@
 </head>
 <body>
 
-<h2>Drag & Drop Folder Upload (Chrome Only)</h2>
+<h2>File Upload</h2>
 <div id="drop-area">
-  Drop folder or files here
+  Drop files or folders here
 </div>
 
 <button id="clearButton" onclick="clearReport()">Clear Report / New Upload</button>
@@ -124,16 +107,13 @@
   <legend>Failure</legend>
   <div id="failure" ></div>
 </fieldset>
-<div id="overlay-message" ></div>
 <div id="file-list" ></div>
 
 <script>
-  // Chrome check
-  const isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
-  if (!isChrome) {
-    alert("⚠️ This uploader works only in Chrome-based browsers. Please switch to Chrome or Edge.");
-    document.body.innerHTML = "<h3 style='color:red;text-align:center'>Unsupported Browser</h3><p style='text-align:center'>This feature is only supported in Chrome-based browsers (e.g., Chrome, Edge).</p>";
-    throw new Error("Unsupported browser");
+  // Check if browser supports folder upload
+  const supportsFolderUpload = 'webkitGetAsEntry' in DataTransferItem.prototype;
+  if (!supportsFolderUpload) {
+    console.warn("Folder upload not supported in this browser. Single file upload will work.");
   }
 
   let totalFiles = 0;
@@ -172,14 +152,8 @@
     dropArea.classList.remove("hover");
 
     const items = e.dataTransfer.items;
-    if (!items) return;
-
-    const entries = [];
-    for (const item of items) {
-      const entry = item.webkitGetAsEntry?.();
-      if (entry) entries.push(entry);
-    }
-
+    const files = e.dataTransfer.files;
+    
     clearReport();
     dropArea.style.display = "none";
     ["status", "progress"].forEach(id => {
@@ -188,13 +162,33 @@
       el.style.display = "block";
       if (fs) fs.style.display = "block";
     });
-    countFilesAndBytes(entries).then(({ count, size }) => {
-      totalFiles = count;
-      totalBytes = size;
-      for (const entry of entries) {
-        traverseFileTree(entry);
+
+    // Try Chrome folder API first
+    if (items && items.length > 0 && items[0].webkitGetAsEntry) {
+      const entries = [];
+      for (const item of items) {
+        const entry = item.webkitGetAsEntry?.();
+        if (entry) entries.push(entry);
       }
-    });
+      
+      countFilesAndBytes(entries).then(({ count, size }) => {
+        totalFiles = count;
+        totalBytes = size;
+        for (const entry of entries) {
+          traverseFileTree(entry);
+        }
+      });
+    } else if (files && files.length > 0) {
+      // Fallback for Firefox/Safari - just files, no folder structure
+      totalFiles = files.length;
+      totalBytes = 0;
+      for (const file of files) {
+        totalBytes += file.size;
+        uploadQueue.push({ file, path: file.name });
+      }
+      processQueue();
+    }
+    
     listFiles();
   });
 
@@ -229,12 +223,16 @@
         processQueue();
       });
     } else if (item.isDirectory) {
-      const dirReader = item.createReader();
-      dirReader.readEntries(entries => {
-        for (const entry of entries) {
-          traverseFileTree(entry, path + item.name + "/");
-        }
-      });
+      if (item.createReader) {
+        const dirReader = item.createReader();
+        dirReader.readEntries(entries => {
+          for (const entry of entries) {
+            traverseFileTree(entry, path + item.name + "/");
+          }
+        });
+      } else {
+        console.warn("Directory upload not supported in this browser");
+      }
     }
   }
 
@@ -264,7 +262,8 @@
   function uploadFile(file, relativePath) {
     const progressContainer = document.getElementById("progress");
     const progressLine = document.createElement("div");
-    progressLine.textContent = `${relativePath}: 0%`;
+    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+    progressLine.textContent = `${relativePath} (${fileSizeMB} MB): 0%`;
     progressContainer.appendChild(progressLine);
 
     fileProgressElements[relativePath] = {
@@ -274,6 +273,7 @@
 
     const formData = new FormData();
     formData.append("file", file, relativePath);
+    formData.append("path", relativePath);
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/");
@@ -292,20 +292,40 @@
       completedFiles++;
       activeUploads--;
       uploadedBytes += file.size;
+      
       if (xhr.status >= 200 && xhr.status < 300) {
-        const responseLines = xhr.responseText.trim().split("\n");
-        for (const line of responseLines) {
-          if (line.startsWith("[SKIPPED]")) {
+        try {
+          const response = JSON.parse(xhr.responseText);
+          if (response.status === 'skipped') {
             skippedLogs.push(relativePath);
             updateDisplayLogs("skipped", skippedLogs);
-          } else {
+          } else if (response.status === 'success') {
             successLogs.push(relativePath);
             updateDisplayLogs("success", successLogs);
+          } else {
+            // Unknown status
+            failedFiles++;
+            failureLogs.push(`${relativePath} → Unknown status: ${response.status}`);
+            updateDisplayLogs("failure", failureLogs);
           }
+        } catch (e) {
+          console.error("Failed to parse JSON response:", e, xhr.responseText);
+          failedFiles++;
+          failureLogs.push(`${relativePath} → Parse error`);
+          updateDisplayLogs("failure", failureLogs);
         }
       } else {
         failedFiles++;
-        failureLogs.push(`${relativePath} → HTTP ${xhr.status}`);
+        let errorMsg = `${relativePath} → HTTP ${xhr.status}`;
+        try {
+          const errorResponse = JSON.parse(xhr.responseText);
+          if (errorResponse.error) {
+            errorMsg += `: ${errorResponse.error}`;
+          }
+        } catch (e) {
+          // Non-JSON error response
+        }
+        failureLogs.push(errorMsg);
         updateDisplayLogs("failure", failureLogs);
       }
 
@@ -320,7 +340,7 @@
         pl.style.display = "none";
         const fs = pl.closest("fieldset");
         if (fs) fs.style.display = "none";
-        showFinalOverlay();
+        listFiles();
       } else {
         processQueue();
       }
@@ -371,28 +391,31 @@
         const container = document.getElementById('file-list');
         container.innerHTML = '';
 
-        const table = document.createElement('table');
-        const headerRow = document.createElement('tr');
-        headerRow.innerHTML = `
-          <th>File/Directory</th>
-          <th>Size</th>
-        `;
-        table.appendChild(headerRow);
-
-        items.forEach(item => {
-          // const div = document.createElement('div');
-          const isDir = item.path.endsWith("/");
-          // print(`Listing: ${item.path} (isDir: ${isDir})`);
-          // div.textContent = `${item.path}${isDir ? '' : ' — ' + formatBytes(item.size)}`;
-          // container.appendChild(div);
-          const row = document.createElement('tr');
-          row.innerHTML = `
-            <td>${item.path}</td>
-            <td>${isDir ? "" : formatBytes(item.size)}</td>
+        // Only show table if there are files
+        if (items.length > 0) {
+          const table = document.createElement('table');
+          const headerRow = document.createElement('tr');
+          headerRow.innerHTML = `
+            <th>File/Directory</th>
+            <th>Size</th>
           `;
-          table.appendChild(row);
-        });
-        container.appendChild(table);
+          table.appendChild(headerRow);
+
+          items.forEach(item => {
+            // const div = document.createElement('div');
+            const isDir = item.path.endsWith("/");
+            // print(`Listing: ${item.path} (isDir: ${isDir})`);
+            // div.textContent = `${item.path}${isDir ? '' : ' — ' + formatBytes(item.size)}`;
+            // container.appendChild(div);
+            const row = document.createElement('tr');
+            row.innerHTML = `
+              <td>${item.path}</td>
+              <td>${isDir ? "" : formatBytes(item.size)}</td>
+            `;
+            table.appendChild(row);
+          });
+          container.appendChild(table);
+        }
       } else {
         alert('Failed to fetch file list: HTTP ' + xhr.status);
       }
@@ -405,19 +428,6 @@
     xhr.send();
   }
 
-  function showFinalOverlay() {
-    const overlay = document.getElementById("overlay-message");
-    overlay.textContent = failedFiles > 0
-      ? `⚠️ Upload completed with errors. ${failedFiles} of ${totalFiles} file(s) failed.`
-      : `✅ Upload completed successfully. All ${totalFiles} file(s) uploaded.`;
-    overlay.style.backgroundColor = failedFiles > 0 ? "#ffecec" : "#e6ffe6";
-    overlay.style.color = failedFiles > 0 ? "red" : "green";
-    overlay.style.display = "block";
-    listFiles();
-    setTimeout(() => {
-      overlay.style.display = "none";
-    }, 5000);
-  }
 
   function clearReport() {
     completedFiles = 0;

@@ -1,165 +1,210 @@
-import http.server
-import socketserver
-import threading
 import os
 import signal
 import sys
-import hashlib
 import json
+import uuid
+from flask import Flask, request, jsonify, send_from_directory
 
 UPLOAD_DIR = "./uploads"
+TMP_DIR = "./tmp"  # Separate directory for temporary upload files
 PORT = 8080
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB max file size
+CHUNK_SIZE = 8192  # 8KB chunks for streaming
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+# Clean up any leftover temp files from previous crashes
+def cleanup_temp_files():
+    """Remove temporary files left over from interrupted uploads"""
+    try:
+        # Clean entire tmp directory - safe because it only contains our temp files
+        for filename in os.listdir(TMP_DIR):
+            temp_file = os.path.join(TMP_DIR, filename)
+            if os.path.isfile(temp_file):
+                os.remove(temp_file)
+                print(f"[CLEANUP] Removed stale temp file: {filename}")
+    except Exception as e:
+        print(f"[ERROR] Cleanup failed: {e}")
 
-class UploadHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/':
-            self.path = '/index.html'
-        elif self.path == '/list':
-            self.list_uploads()
-            return
-        return super().do_GET()
+cleanup_temp_files()
 
-    def list_uploads(self):
-        uploads_abs = os.path.abspath(UPLOAD_DIR)
-        result = []
+# Flask app - single server for all file uploads
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+def handle_file_upload(file, relative_path):
+    """
+    Common file upload handler with streaming support for large files.
+    Handles versioning and duplicate detection.
+    """
+    # Security: prevent empty paths
+    if not relative_path or not relative_path.strip():
+        print(f"[SECURITY] Empty path rejected")
+        return {'error': 'Empty path not allowed', 'status': 'error'}, 400
+
+    # Security: prevent null byte injection
+    if '\x00' in relative_path:
+        print(f"[SECURITY] Null byte injection blocked: {repr(relative_path)}")
+        return {'error': 'Null bytes not allowed in path', 'status': 'error'}, 400
+
+    # Security: prevent path traversal
+    if relative_path.startswith("/") or ".." in relative_path:
+        print(f"[SECURITY] Path traversal attempt blocked: {relative_path}")
+        return {'error': 'Unsafe path', 'status': 'error'}, 400
+
+    filepath = os.path.abspath(os.path.join(UPLOAD_DIR, relative_path))
+    uploads_abs = os.path.abspath(UPLOAD_DIR)
+
+    # Security: ensure filepath is strictly inside uploads directory (not equal to it)
+    if not filepath.startswith(uploads_abs + os.sep):
+        print(f"[SECURITY] Path outside upload dir blocked: {relative_path}")
+        return {'error': 'Outside upload dir', 'status': 'error'}, 400
+
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    # Save new file to temp directory first for comparison
+    # Use UUID to prevent race conditions with concurrent uploads
+    # Store in separate tmp directory to avoid conflicts with user uploads
+    temp_filename = f"{uuid.uuid4().hex}.tmp"
+    temp_path = os.path.join(TMP_DIR, temp_filename)
+
+    # Stream file to disk in chunks (memory efficient)
+    try:
+        with open(temp_path, 'wb') as f:
+            while True:
+                chunk = file.stream.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:
+        # Clean up temp file on failure
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        print(f"[ERROR] Upload streaming failed for {relative_path}: {e}")
+        raise
+
+    # Check if file exists and handle versioning
+    if os.path.exists(filepath):
+        # Compare files using chunks to avoid loading large files into memory
+        files_identical = False
+        try:
+            with open(temp_path, 'rb') as new_file, open(filepath, 'rb') as existing_file:
+                files_identical = True
+                while True:
+                    new_chunk = new_file.read(CHUNK_SIZE)
+                    existing_chunk = existing_file.read(CHUNK_SIZE)
+                    if new_chunk != existing_chunk:
+                        files_identical = False
+                        break
+                    if not new_chunk:  # End of file
+                        break
+        except Exception as e:
+            print(f"[ERROR] Comparison failed: {e}")
+            files_identical = False
+
+        if files_identical:
+            os.remove(temp_path)
+            print(f"[SKIP] {relative_path} (duplicate)")
+            return {'status': 'skipped', 'path': relative_path}, 200
+
+        # Create versioned filename
+        base, ext = os.path.splitext(filepath)
+        counter = 1
+        versioned_filepath = filepath
+        while os.path.exists(versioned_filepath):
+            versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
+            counter += 1
+
+        # Security: ensure versioned file will be created inside uploads directory
+        versioned_abs = os.path.abspath(versioned_filepath)
+        if not versioned_abs.startswith(uploads_abs + os.sep):
+            os.remove(temp_path)  # Clean up temp file
+            print(f"[SECURITY] Versioned path outside upload dir blocked: {versioned_filepath}")
+            return {'error': 'Versioned file would be outside upload dir', 'status': 'error'}, 400
+
+        os.rename(temp_path, versioned_filepath)
+        print(f"[UPLOAD] {relative_path} → version ({counter-1})")
+        return {'status': 'success', 'path': os.path.basename(versioned_filepath)}, 200
+    else:
+        os.rename(temp_path, filepath)
+        print(f"[UPLOAD] {relative_path} (new file)")
+        return {'status': 'success', 'path': os.path.basename(filepath)}, 200
+
+@app.route('/', methods=['GET', 'POST'])
+def handle_request():
+    """Unified handler for all requests"""
+    if request.method == 'GET':
+        # Serve the main page
+        return send_from_directory('.', 'index.html')
+
+    elif request.method == 'POST':
+        # Handle file upload (both small and large files)
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part', 'status': 'error'}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file', 'status': 'error'}), 400
+
+        # Get the relative path from form data (multipart) or use filename
+        relative_path = request.form.get('path', file.filename)
 
         try:
-            for entry in os.listdir(uploads_abs):
-                full_path = os.path.join(uploads_abs, entry)
-                if os.path.isdir(full_path):
-                    result.append({
-                        "path": entry + "/",  # Mark directory with '/'
-                        "size": 0
-                    })
-                elif os.path.isfile(full_path):
-                    result.append({
-                        "path": entry,
-                        "size": os.path.getsize(full_path)
-                    })
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result, indent=2).encode())
-
+            result, status_code = handle_file_upload(file, relative_path)
+            return jsonify(result), status_code
         except Exception as e:
-            self.send_error(500, f"Error: {e}")
+            print(f"[ERROR] Upload failed: {e}")
+            return jsonify({'error': str(e), 'status': 'error'}), 500
 
-    def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        content_type = self.headers.get('Content-Type', '')
+@app.route('/list', methods=['GET'])
+def list_files():
+    """List uploaded files"""
+    uploads_abs = os.path.abspath(UPLOAD_DIR)
+    result = []
 
-        if content_length <= 0 or "boundary=" not in content_type:
-            self.send_error(400, "Invalid POST request")
-            return
+    try:
+        for entry in os.listdir(uploads_abs):
+            full_path = os.path.join(uploads_abs, entry)
+            if os.path.isdir(full_path):
+                result.append({
+                    "path": entry + "/",
+                    "size": 0
+                })
+            elif os.path.isfile(full_path):
+                result.append({
+                    "path": entry,
+                    "size": os.path.getsize(full_path)
+                })
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-        boundary = content_type.split("boundary=")[1].strip().encode()
-        data = self.rfile.read(content_length)
-        parts = data.split(b"--" + boundary)
-
-        uploaded_files = []
-
-        for part in parts:
-            if b'filename="' not in part or b'\r\n\r\n' not in part:
-                continue
-
-            try:
-                headers, file_data = part.split(b'\r\n\r\n', 1)
-                header_str = headers.decode(errors='ignore')
-                filename = header_str.split('filename="')[1].split('"')[0]
-                filename = filename.replace("\\", "/")
-
-                if filename.startswith("/") or ".." in filename:
-                    raise ValueError("Unsafe path")
-
-                filepath = os.path.abspath(os.path.join(UPLOAD_DIR, filename))
-                if not filepath.startswith(os.path.abspath(UPLOAD_DIR)):
-                    raise ValueError("Outside upload dir")
-
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
-                if file_data.endswith(b"\r\n"):
-                    file_data = file_data[:-2]
-                elif file_data.endswith(b"--"):
-                    file_data = file_data[:-2]
-
-                file_written = False
-
-                if os.path.exists(filepath):
-                    with open(filepath, 'rb') as existing:
-                        existing_data = existing.read()
-                    if existing_data == file_data:
-                        # Skip if the content is the same - is matching only with base version
-                        # This is a simple check; for more robust versioning, consider using hashes
-                        # Can be improved to check for all versions
-                        print(f"[SKIP] Same content: {filepath}")
-                        uploaded_files.append("[SKIPPED] " + filepath)
-                        continue
-                    else:
-                        base, ext = os.path.splitext(filepath)
-                        counter = 1
-                        versioned_filepath = filepath
-                        while os.path.exists(versioned_filepath):
-                            versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
-                            counter += 1
-                        with open(versioned_filepath, 'wb') as f:
-                            f.write(file_data)
-                        print(f"[UPLOAD] New version created: {versioned_filepath}")
-                        uploaded_files.append(os.path.basename(versioned_filepath))
-                        file_written = True
-                else:
-                    with open(filepath, 'wb') as f:
-                        f.write(file_data)
-                    print(f"[UPLOAD] New file: {filepath}")
-                    uploaded_files.append(os.path.basename(filepath))
-                    file_written = True
-
-            except Exception as e:
-                print(f"[ERROR] {e}")
-                self.send_error(500, f"Upload failed: {e}")
-                return
-
-        if uploaded_files:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write("\n".join(uploaded_files).encode())
-        else:
-            self.send_error(400, "No valid file found")
-
-    def log_message(self, format, *args):
-        # print(f"[REQUEST] {self.client_address[0]} - {format % args}")
-        pass
+@app.route('/<path:filename>')
+def serve_static(filename):
+    """Serve static files"""
+    return send_from_directory('.', filename)
 
 # Setup and run the server
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
-httpd = ThreadedHTTPServer(("", PORT), UploadHandler)
 
 def shutdown_server(signum=None, frame=None):
-    print("\n🔴 Shutting down server...")
-    httpd.shutdown()
-    httpd.server_close()
-    print("✅ Server stopped.")
+    print("\n✅ Server stopped.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, shutdown_server)
 signal.signal(signal.SIGTERM, shutdown_server)
 
-thread = threading.Thread(target=httpd.serve_forever)
-thread.daemon = True
-thread.start()
+if __name__ == '__main__':
+    server_ip = sys.argv[1] if len(sys.argv) > 1 else "localhost"
 
-server_ip = sys.argv[1] if len(sys.argv) > 1 else "localhost"
-print(f"✅ Server running at http://{server_ip}:{PORT}")
-print(f"📂 Upload directory: {os.path.abspath(UPLOAD_DIR)}")
-print("🔁 Press Ctrl+C to stop...")
+    print()
+    print(f"✅ Server running at http://{server_ip}:{PORT}")
+    print(f"📂 Upload directory: {os.path.abspath(UPLOAD_DIR)}")
+    print(f"📏 Maximum file size: {MAX_FILE_SIZE / (1024**3):.0f}GB")
+    print(f"🔧 Chunk size: {CHUNK_SIZE} bytes")
+    print("🔁 Press Ctrl+C to stop...")
+    print()
 
-try:
-    thread.join()
-except KeyboardInterrupt:
-    shutdown_server()
+    # Start Flask development server
+    app.run(host='0.0.0.0', port=PORT, threaded=True, debug=False)
