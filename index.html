@@ -76,10 +76,158 @@
     tr:hover {
       background-color: #e6f7ff;
     }
+    /* Modal Styles */
+    .modal {
+      display: none;
+      position: fixed;
+      z-index: 1000;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      background-color: rgba(0,0,0,0.4);
+    }
+    .modal-content {
+      background-color: #fefefe;
+      margin: 5% auto;
+      padding: 20px;
+      border: 1px solid #888;
+      border-radius: 10px;
+      width: 80%;
+      max-width: 800px;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+    .modal-header h2 {
+      margin: 0;
+    }
+    .close {
+      color: #aaa;
+      font-size: 28px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .close:hover,
+    .close:focus {
+      color: black;
+    }
+    .conflict-item {
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      padding: 15px;
+      margin-bottom: 15px;
+      background-color: #f9f9f9;
+    }
+    .conflict-path {
+      font-weight: bold;
+      margin-bottom: 10px;
+      color: #333;
+    }
+    .conflict-details {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-size: 0.9em;
+    }
+    .detail-item {
+      padding: 5px;
+      background-color: white;
+      border-radius: 3px;
+    }
+    .detail-label {
+      font-weight: bold;
+      color: #666;
+    }
+    .strategy-selector {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .strategy-selector label {
+      font-weight: bold;
+    }
+    .strategy-selector select {
+      padding: 5px 10px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+    }
+    .modal-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    .modal-buttons button {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .btn-primary {
+      background-color: #007bff;
+      color: white;
+    }
+    .btn-primary:hover {
+      background-color: #0056b3;
+    }
+    .btn-secondary {
+      background-color: #6c757d;
+      color: white;
+    }
+    .btn-secondary:hover {
+      background-color: #545b62;
+    }
   </style>
   <link type="image/png" sizes="16x16" rel="icon" href="favicon.png">
 </head>
 <body>
+
+<!-- Conflict Resolution Modal -->
+<div id="conflictModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>Resolve Conflicts</h2>
+      <span class="close" onclick="closeConflictModal()">&times;</span>
+    </div>
+
+    <div id="conflictList"></div>
+
+    <div class="modal-buttons">
+      <button class="btn-secondary" onclick="closeConflictModal()">Cancel</button>
+      <button class="btn-primary" onclick="proceedWithUpload()">Proceed with Upload</button>
+    </div>
+  </div>
+</div>
+
+<!-- File-Level Conflict Resolution Modal for Merge -->
+<div id="fileConflictModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>File Conflicts in Merged Directories</h2>
+      <span class="close" onclick="closeFileConflictModal()">&times;</span>
+    </div>
+
+    <p style="margin-bottom: 15px; color: #666;">The following files already exist with <strong>different sizes</strong>. Choose how to handle each:</p>
+    <p style="margin-bottom: 15px; color: #999; font-size: 0.9em;">Note: Files with identical sizes will be checked automatically and skipped if identical.</p>
+
+    <div id="fileConflictList"></div>
+
+    <div class="modal-buttons">
+      <button class="btn-secondary" onclick="closeFileConflictModal()">Cancel</button>
+      <button class="btn-primary" onclick="proceedWithFileConflictResolution()">Continue Upload</button>
+    </div>
+  </div>
+</div>
 
 <h2>File Upload</h2>
 <div id="drop-area">
@@ -87,23 +235,23 @@
 </div>
 
 <button id="clearButton" onclick="clearReport()">Clear Report / New Upload</button>
-<fieldset id="fieldsetSection"> 
+<fieldset id="fieldsetSection">
   <legend>Status</legend>
   <div id="status" ></div>
 </fieldset>
-<fieldset id="fieldsetSection"> 
+<fieldset id="fieldsetSection">
   <legend>Progress</legend>
   <div id="progress" ></div>
 </fieldset>
-<fieldset id="fieldsetSection"> 
+<fieldset id="fieldsetSection">
   <legend>Success</legend>
   <div id="success" ></div>
 </fieldset>
-<fieldset id="fieldsetSection"> 
+<fieldset id="fieldsetSection">
   <legend>Already Present</legend>
   <div id="skipped" ></div>
 </fieldset>
-<fieldset id="fieldsetSection"> 
+<fieldset id="fieldsetSection">
   <legend>Failure</legend>
   <div id="failure" ></div>
 </fieldset>
@@ -131,6 +279,15 @@
   const skippedLogs = [];
   const fileProgressElements = {};
 
+  // Conflict resolution state
+  let pendingUploadQueue = [];
+  let conflictResolutions = {}; // Map of path -> strategy
+  let fileConflictResolutions = {}; // Map of file path -> strategy for merge conflicts
+
+  // Performance optimization: throttle progress updates
+  const progressUpdateThrottle = 100; // ms
+  const lastProgressUpdate = {};
+
   const dropArea = document.getElementById("drop-area");
   window.addEventListener("dragover", e => e.preventDefault(), false);
   window.addEventListener("drop", e => e.preventDefault(), false);
@@ -153,15 +310,10 @@
 
     const items = e.dataTransfer.items;
     const files = e.dataTransfer.files;
-    
+
     clearReport();
-    dropArea.style.display = "none";
-    ["status", "progress"].forEach(id => {
-      const el = document.getElementById(id);
-      const fs = el.closest("fieldset");
-      el.style.display = "block";
-      if (fs) fs.style.display = "block";
-    });
+    pendingUploadQueue = [];
+    conflictResolutions = {};
 
     // Try Chrome folder API first
     if (items && items.length > 0 && items[0].webkitGetAsEntry) {
@@ -170,71 +322,22 @@
         const entry = item.webkitGetAsEntry?.();
         if (entry) entries.push(entry);
       }
-      
-      countFilesAndBytes(entries).then(({ count, size }) => {
-        totalFiles = count;
-        totalBytes = size;
-        for (const entry of entries) {
-          traverseFileTree(entry);
-        }
+
+      // Collect all files first
+      collectAllFiles(entries).then(collectedFiles => {
+        pendingUploadQueue = collectedFiles;
+        checkForConflicts(collectedFiles);
       });
     } else if (files && files.length > 0) {
       // Fallback for Firefox/Safari - just files, no folder structure
-      totalFiles = files.length;
-      totalBytes = 0;
+      const collectedFiles = [];
       for (const file of files) {
-        totalBytes += file.size;
-        uploadQueue.push({ file, path: file.name });
+        collectedFiles.push({ file, path: file.name, isDirectory: false });
       }
-      processQueue();
+      pendingUploadQueue = collectedFiles;
+      checkForConflicts(collectedFiles);
     }
-    
-    listFiles();
   });
-
-  function countFilesAndBytes(entries) {
-    const promises = entries.map(entry => {
-      return new Promise(resolve => {
-        if (entry.isFile) {
-          entry.file(file => resolve({ count: 1, size: file.size }));
-        } else if (entry.isDirectory) {
-          const reader = entry.createReader();
-          reader.readEntries(subEntries => {
-            countFilesAndBytes(subEntries).then(resolve);
-          });
-        } else {
-          resolve({ count: 0, size: 0 });
-        }
-      });
-    });
-
-    return Promise.all(promises).then(results => {
-      return results.reduce((acc, r) => ({
-        count: acc.count + r.count,
-        size: acc.size + r.size
-      }), { count: 0, size: 0 });
-    });
-  }
-
-  function traverseFileTree(item, path = "") {
-    if (item.isFile) {
-      item.file(file => {
-        uploadQueue.push({ file, path: path + file.name });
-        processQueue();
-      });
-    } else if (item.isDirectory) {
-      if (item.createReader) {
-        const dirReader = item.createReader();
-        dirReader.readEntries(entries => {
-          for (const entry of entries) {
-            traverseFileTree(entry, path + item.name + "/");
-          }
-        });
-      } else {
-        console.warn("Directory upload not supported in this browser");
-      }
-    }
-  }
 
   function processQueue() {
     while (activeUploads < MAX_CONCURRENT_UPLOADS && uploadQueue.length > 0) {
@@ -260,30 +363,69 @@
   }
 
   function uploadFile(file, relativePath) {
+    // Determine strategy for this file based on root directory
+    const parts = relativePath.split('/');
+    const rootName = parts[0];
+    const strategy = conflictResolutions[rootName] || 'rename';
+
+    // If strategy is 'rename' and we have a versioned path, use it
+    let actualPath = relativePath;
+    if (strategy === 'rename' && window.versionedPaths && window.versionedPaths[rootName]) {
+      // Replace the root directory name with the versioned name
+      parts[0] = window.versionedPaths[rootName];
+      actualPath = parts.join('/');
+    }
+
     const progressContainer = document.getElementById("progress");
     const progressLine = document.createElement("div");
     const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
-    progressLine.textContent = `${relativePath} (${fileSizeMB} MB): 0%`;
+    progressLine.textContent = `${actualPath} (${fileSizeMB} MB): 0%`;
     progressContainer.appendChild(progressLine);
 
-    fileProgressElements[relativePath] = {
+    fileProgressElements[actualPath] = {
       element: progressLine,
       lastLoaded: 0
     };
 
+    // Determine file strategy
+    let fileStrategy;
+    if (parts.length === 1) {
+      // Root-level file - use the root strategy
+      fileStrategy = strategy;
+    } else if (strategy === 'merge' && fileConflictResolutions[relativePath]) {
+      // File in merged directory with user-selected resolution
+      fileStrategy = fileConflictResolutions[relativePath];
+    } else if (strategy === 'merge') {
+      // File in merged directory without conflict - use rename as safe default
+      fileStrategy = 'rename';
+    } else {
+      // File in directory with other strategy
+      fileStrategy = strategy;
+    }
+
     const formData = new FormData();
     formData.append("file", file, relativePath);
-    formData.append("path", relativePath);
+    formData.append("path", actualPath);
+    formData.append("strategy", fileStrategy);
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/");
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
-        const percent = Math.round((e.loaded / e.total) * 100);
-        const fileState = fileProgressElements[relativePath];
+        const now = Date.now();
+        const lastUpdate = lastProgressUpdate[actualPath] || 0;
 
-        fileState.element.textContent = `${relativePath}: ${percent}% (${formatBytes(e.loaded)} / ${formatBytes(e.total)})`;
+        // Throttle progress updates to reduce DOM manipulation
+        if (now - lastUpdate < progressUpdateThrottle && e.loaded < e.total) {
+          return;
+        }
+
+        lastProgressUpdate[actualPath] = now;
+        const percent = Math.round((e.loaded / e.total) * 100);
+        const fileState = fileProgressElements[actualPath];
+
+        fileState.element.textContent = `${actualPath}: ${percent}% (${formatBytes(e.loaded)} / ${formatBytes(e.total)})`;
         updateOverallStatus();
       }
     };
@@ -292,31 +434,31 @@
       completedFiles++;
       activeUploads--;
       uploadedBytes += file.size;
-      
+
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           const response = JSON.parse(xhr.responseText);
           if (response.status === 'skipped') {
-            skippedLogs.push(relativePath);
+            skippedLogs.push(actualPath);
             updateDisplayLogs("skipped", skippedLogs);
           } else if (response.status === 'success') {
-            successLogs.push(relativePath);
+            successLogs.push(actualPath);
             updateDisplayLogs("success", successLogs);
           } else {
             // Unknown status
             failedFiles++;
-            failureLogs.push(`${relativePath} → Unknown status: ${response.status}`);
+            failureLogs.push(`${actualPath} → Unknown status: ${response.status}`);
             updateDisplayLogs("failure", failureLogs);
           }
         } catch (e) {
           console.error("Failed to parse JSON response:", e, xhr.responseText);
           failedFiles++;
-          failureLogs.push(`${relativePath} → Parse error`);
+          failureLogs.push(`${actualPath} → Parse error`);
           updateDisplayLogs("failure", failureLogs);
         }
       } else {
         failedFiles++;
-        let errorMsg = `${relativePath} → HTTP ${xhr.status}`;
+        let errorMsg = `${actualPath} → HTTP ${xhr.status}`;
         try {
           const errorResponse = JSON.parse(xhr.responseText);
           if (errorResponse.error) {
@@ -329,8 +471,12 @@
         updateDisplayLogs("failure", failureLogs);
       }
 
-      document.getElementById("progress").removeChild(fileProgressElements[relativePath].element);
-      delete fileProgressElements[relativePath];
+      const progressEl = fileProgressElements[actualPath];
+      if (progressEl && progressEl.element) {
+        document.getElementById("progress").removeChild(progressEl.element);
+      }
+      delete fileProgressElements[actualPath];
+      delete lastProgressUpdate[actualPath]; // Clean up throttle tracking
       updateOverallStatus();
 
       if (completedFiles === totalFiles) {
@@ -350,10 +496,14 @@
       completedFiles++;
       activeUploads--;
       failedFiles++;
-      failureLogs.push(`${relativePath} → Upload failed`);
+      failureLogs.push(`${actualPath} → Upload failed`);
       updateDisplayLogs("failure", failureLogs);
-      document.getElementById("progress").removeChild(fileProgressElements[relativePath].element);
-      delete fileProgressElements[relativePath];
+      const progressEl = fileProgressElements[actualPath];
+      if (progressEl && progressEl.element) {
+        document.getElementById("progress").removeChild(progressEl.element);
+      }
+      delete fileProgressElements[actualPath];
+      delete lastProgressUpdate[actualPath]; // Clean up throttle tracking
       updateOverallStatus();
       processQueue();
     };
@@ -372,21 +522,25 @@
     }
     container.style.display = "block";
     if (fieldset) fieldset.style.display = "block";
+
+    // Use document fragment for batch DOM updates
+    const fragment = document.createDocumentFragment();
     for (const line of logArray) {
       const div = document.createElement("div");
       div.textContent = line;
-      container.appendChild(div);
+      fragment.appendChild(div);
     }
+    container.appendChild(fragment);
     container.scrollTop = container.scrollHeight;
   }
 
   function listFiles() {
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', '/list', true);
+    // Add timestamp to prevent caching and ensure immediate updates
+    xhr.open('GET', '/list?t=' + Date.now(), true);
 
     xhr.onload = function () {
       if (xhr.status >= 200 && xhr.status < 300) {
-        console.log('file: ', xhr.responseText);
         const items = JSON.parse(xhr.responseText);
         const container = document.getElementById('file-list');
         container.innerHTML = '';
@@ -401,28 +555,28 @@
           `;
           table.appendChild(headerRow);
 
-          items.forEach(item => {
-            // const div = document.createElement('div');
+          // Use document fragment for batch row creation
+          const fragment = document.createDocumentFragment();
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
             const isDir = item.path.endsWith("/");
-            // print(`Listing: ${item.path} (isDir: ${isDir})`);
-            // div.textContent = `${item.path}${isDir ? '' : ' — ' + formatBytes(item.size)}`;
-            // container.appendChild(div);
             const row = document.createElement('tr');
             row.innerHTML = `
               <td>${item.path}</td>
               <td>${isDir ? "" : formatBytes(item.size)}</td>
             `;
-            table.appendChild(row);
-          });
+            fragment.appendChild(row);
+          }
+          table.appendChild(fragment);
           container.appendChild(table);
         }
       } else {
-        alert('Failed to fetch file list: HTTP ' + xhr.status);
+        console.error('Failed to fetch file list: HTTP ' + xhr.status);
       }
     };
 
     xhr.onerror = function () {
-      alert('Failed to fetch file list: Network error');
+      console.error('Failed to fetch file list: Network error');
     };
 
     xhr.send();
@@ -440,6 +594,8 @@
     successLogs.length = 0;
     failureLogs.length = 0;
     skippedLogs.length = 0;
+    conflictResolutions = {};
+    fileConflictResolutions = {};
     Object.keys(fileProgressElements).forEach(key => delete fileProgressElements[key]);
 
     ["status", "progress", "success", "failure", "skipped"].forEach(id => {
@@ -450,6 +606,397 @@
       const fs = el.closest("fieldset");
       if (fs) fs.style.display = "none";
     });
+  }
+
+  // Collect all files from entries recursively
+  function collectAllFiles(entries) {
+    const promises = entries.map(entry => {
+      return new Promise(resolve => {
+        if (entry.isFile) {
+          entry.file(file => {
+            resolve([{ file, path: entry.fullPath.substring(1), isDirectory: false }]);
+          });
+        } else if (entry.isDirectory) {
+          const reader = entry.createReader();
+          reader.readEntries(subEntries => {
+            collectAllFiles(subEntries).then(subFiles => {
+              // Also track the directory itself
+              const dirPath = entry.fullPath.substring(1);
+              resolve([{ file: null, path: dirPath, isDirectory: true }, ...subFiles]);
+            });
+          });
+        } else {
+          resolve([]);
+        }
+      });
+    });
+
+    return Promise.all(promises).then(results => {
+      return results.flat();
+    });
+  }
+
+  // Check for conflicts with existing files/folders
+  function checkForConflicts(collectedFiles) {
+    // Extract root-level items only (optimized with early size calculation)
+    const rootItems = new Map();
+
+    for (const item of collectedFiles) {
+      const parts = item.path.split('/');
+      const rootName = parts[0];
+
+      if (!rootItems.has(rootName)) {
+        const isRootDir = item.isDirectory || parts.length > 1;
+        rootItems.set(rootName, {
+          path: rootName,
+          size: item.isDirectory ? 0 : item.file.size,
+          isDirectory: isRootDir
+        });
+      }
+    }
+
+    if (rootItems.size === 0) {
+      startUpload();
+      return;
+    }
+
+    // Use existing /list endpoint to check for conflicts
+    fetch('/list?t=' + Date.now())
+      .then(response => response.json())
+      .then(existingItems => {
+        // Create lookup map for existing items (optimized single pass)
+        const existingMap = new Map();
+        for (let i = 0; i < existingItems.length; i++) {
+          const item = existingItems[i];
+          const cleanPath = item.path.replace('/', '');
+          existingMap.set(cleanPath, {
+            size: item.size,
+            isDirectory: item.path.endsWith('/')
+          });
+        }
+
+        // Check each root item for conflicts (pre-allocate array)
+        const conflicts = [];
+        rootItems.forEach((newItem, path) => {
+          const existing = existingMap.get(path);
+          if (existing) {
+            conflicts.push({
+              path: path,
+              newSize: newItem.size,
+              existingSize: existing.size,
+              isDirectory: newItem.isDirectory,
+              existingIsDirectory: existing.isDirectory,
+              typeMismatch: newItem.isDirectory !== existing.isDirectory
+            });
+          }
+        });
+
+        if (conflicts.length > 0) {
+          showConflictModal(conflicts);
+        } else {
+          startUpload();
+        }
+      })
+      .catch(error => {
+        console.error('Error checking conflicts:', error);
+        startUpload(); // Proceed with upload anyway
+      });
+  }
+
+  // Show conflict resolution modal
+  function showConflictModal(conflicts) {
+    const modal = document.getElementById('conflictModal');
+    const conflictList = document.getElementById('conflictList');
+    conflictList.innerHTML = '';
+
+    // Use document fragment for better performance
+    const fragment = document.createDocumentFragment();
+
+    conflicts.forEach((conflict, index) => {
+      const conflictDiv = document.createElement('div');
+      conflictDiv.className = 'conflict-item';
+
+      const pathDiv = document.createElement('div');
+      pathDiv.className = 'conflict-path';
+      pathDiv.textContent = conflict.path + (conflict.isDirectory ? '/' : '');
+      conflictDiv.appendChild(pathDiv);
+
+      const detailsDiv = document.createElement('div');
+      detailsDiv.className = 'conflict-details';
+
+      if (conflict.typeMismatch) {
+        detailsDiv.innerHTML = `
+          <div class="detail-item"><span class="detail-label">Type Conflict:</span> Existing is ${conflict.existingIsDirectory ? 'directory' : 'file'}, new is ${conflict.isDirectory ? 'directory' : 'file'}</div>
+        `;
+      } else if (!conflict.isDirectory) {
+        detailsDiv.innerHTML = `
+          <div class="detail-item"><span class="detail-label">Existing Size:</span> ${formatBytes(conflict.existingSize)}</div>
+          <div class="detail-item"><span class="detail-label">New Size:</span> ${formatBytes(conflict.newSize)}</div>
+        `;
+      } else {
+        detailsDiv.innerHTML = `
+          <div class="detail-item"><span class="detail-label">Type:</span> Directory</div>
+        `;
+      }
+
+      conflictDiv.appendChild(detailsDiv);
+
+      const strategyDiv = document.createElement('div');
+      strategyDiv.className = 'strategy-selector';
+      strategyDiv.innerHTML = `
+        <label>Strategy:</label>
+        <select id="strategy_${index}" data-path="${conflict.path}">
+          <option value="rename">Rename</option>
+          ${conflict.isDirectory ? '<option value="merge">Merge</option>' : '<option value="replace">Replace existing</option>'}
+          <option value="skip">Skip</option>
+        </select>
+      `;
+      conflictDiv.appendChild(strategyDiv);
+
+      fragment.appendChild(conflictDiv);
+
+      // Set default resolution
+      conflictResolutions[conflict.path] = 'rename';
+    });
+
+    // Single DOM update
+    conflictList.appendChild(fragment);
+    modal.style.display = 'block';
+  }
+
+  // Close conflict modal
+  function closeConflictModal() {
+    const modal = document.getElementById('conflictModal');
+    modal.style.display = 'none';
+    pendingUploadQueue = [];
+    conflictResolutions = {};
+    fileConflictResolutions = {};
+    dropArea.style.display = 'flex';
+  }
+
+  // Proceed with upload after conflict resolution
+  function proceedWithUpload() {
+    // Collect all strategy selections
+    const strategySelects = document.querySelectorAll('[id^="strategy_"]');
+    strategySelects.forEach(select => {
+      const path = select.getAttribute('data-path');
+      conflictResolutions[path] = select.value;
+    });
+
+    // Close modal
+    const modal = document.getElementById('conflictModal');
+    modal.style.display = 'none';
+
+    // Check if any directories are being merged
+    const mergeDirectories = Object.entries(conflictResolutions)
+      .filter(([path, strategy]) => strategy === 'merge')
+      .map(([path]) => path);
+
+    if (mergeDirectories.length > 0) {
+      // Check for file-level conflicts in merge directories
+      checkFileConflictsInMerge(mergeDirectories);
+    } else {
+      // Determine versioned directory names for directories with 'rename' strategy
+      determineVersionedPaths().then(() => {
+        startUpload();
+      });
+    }
+  }
+
+  // Check for file-level conflicts in directories being merged
+  function checkFileConflictsInMerge(mergeDirectories) {
+    // Collect all files that will be uploaded to merge directories
+    const filesToCheck = [];
+
+    for (const item of pendingUploadQueue) {
+      if (!item.isDirectory && item.file) {
+        const parts = item.path.split('/');
+        const rootName = parts[0];
+
+        if (mergeDirectories.includes(rootName)) {
+          filesToCheck.push(item.path);
+        }
+      }
+    }
+
+    if (filesToCheck.length === 0) {
+      // No files to check, proceed
+      determineVersionedPaths().then(() => startUpload());
+      return;
+    }
+
+    // Call server to check which files exist
+    fetch('/check-file-conflicts', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ paths: filesToCheck })
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.conflicts && data.conflicts.length > 0) {
+        // Get file sizes from pending queue and filter out same-size files
+        const fileConflicts = data.conflicts
+          .map(conflict => {
+            const queueItem = pendingUploadQueue.find(item => item.path === conflict.path);
+            return {
+              path: conflict.path,
+              existingSize: conflict.existingSize,
+              newSize: queueItem ? queueItem.file.size : 0
+            };
+          })
+          .filter(conflict => conflict.existingSize !== conflict.newSize); // Only show different sizes
+
+        if (fileConflicts.length > 0) {
+          showFileConflictModal(fileConflicts);
+        } else {
+          // No file conflicts (all same size), proceed with upload
+          determineVersionedPaths().then(() => startUpload());
+        }
+      } else {
+        // No file conflicts, proceed with upload
+        determineVersionedPaths().then(() => startUpload());
+      }
+    })
+    .catch(error => {
+      console.error('Error checking file conflicts:', error);
+      // Proceed anyway
+      determineVersionedPaths().then(() => startUpload());
+    });
+  }
+
+  // Show file-level conflict modal
+  function showFileConflictModal(fileConflicts) {
+    const modal = document.getElementById('fileConflictModal');
+    const conflictList = document.getElementById('fileConflictList');
+    conflictList.innerHTML = '';
+
+    const fragment = document.createDocumentFragment();
+
+    fileConflicts.forEach((conflict, index) => {
+      const conflictDiv = document.createElement('div');
+      conflictDiv.className = 'conflict-item';
+
+      const pathDiv = document.createElement('div');
+      pathDiv.className = 'conflict-path';
+      pathDiv.textContent = conflict.path;
+      conflictDiv.appendChild(pathDiv);
+
+      const detailsDiv = document.createElement('div');
+      detailsDiv.className = 'conflict-details';
+      detailsDiv.innerHTML = `
+        <div class="detail-item"><span class="detail-label">Existing Size:</span> ${formatBytes(conflict.existingSize)}</div>
+        <div class="detail-item"><span class="detail-label">New Size:</span> ${formatBytes(conflict.newSize)}</div>
+      `;
+      conflictDiv.appendChild(detailsDiv);
+
+      const strategyDiv = document.createElement('div');
+      strategyDiv.className = 'strategy-selector';
+      strategyDiv.innerHTML = `
+        <label>Action:</label>
+        <select id="file_strategy_${index}" data-path="${conflict.path}">
+          <option value="replace">Replace with new</option>
+          <option value="rename">Keep both</option>
+          <option value="skip">Skip</option>
+        </select>
+      `;
+      conflictDiv.appendChild(strategyDiv);
+
+      fragment.appendChild(conflictDiv);
+
+      // Set default resolution
+      fileConflictResolutions[conflict.path] = 'replace';
+    });
+
+    conflictList.appendChild(fragment);
+    modal.style.display = 'block';
+  }
+
+  // Close file conflict modal
+  function closeFileConflictModal() {
+    const modal = document.getElementById('fileConflictModal');
+    modal.style.display = 'none';
+    fileConflictResolutions = {};
+    dropArea.style.display = 'flex';
+    pendingUploadQueue = [];
+    conflictResolutions = {};
+  }
+
+  // Proceed after file conflict resolution
+  function proceedWithFileConflictResolution() {
+    // Collect all file strategy selections
+    const strategySelects = document.querySelectorAll('[id^="file_strategy_"]');
+    strategySelects.forEach(select => {
+      const path = select.getAttribute('data-path');
+      fileConflictResolutions[path] = select.value;
+    });
+
+    // Close modal
+    const modal = document.getElementById('fileConflictModal');
+    modal.style.display = 'none';
+
+    // Now proceed with upload
+    determineVersionedPaths().then(() => startUpload());
+  }
+
+  // Determine versioned directory names for rename strategy
+  function determineVersionedPaths() {
+    window.versionedPaths = {};
+
+    // Fetch fresh data instead of using cache
+    return fetch('/list?t=' + Date.now())
+      .then(response => response.json())
+      .then(existingItems => {
+        const existingNames = existingItems.map(item => item.path.replace('/', ''));
+
+        for (const [path, strategy] of Object.entries(conflictResolutions)) {
+          if (strategy === 'rename') {
+            // Calculate versioned name
+            let counter = 1;
+            let versionedName = path;
+
+            while (existingNames.includes(versionedName) ||
+                   existingNames.includes(versionedName + '/')) {
+              versionedName = `${path} (${counter})`;
+              counter++;
+            }
+
+            if (versionedName !== path) {
+              window.versionedPaths[path] = versionedName;
+            }
+          }
+        }
+      })
+      .catch(error => {
+        console.error('Error fetching file list for versioning:', error);
+        // Continue anyway with no versioned paths
+      });
+  }
+
+  // Start the actual upload process
+  function startUpload() {
+    dropArea.style.display = "none";
+    ["status", "progress"].forEach(id => {
+      const el = document.getElementById(id);
+      const fs = el.closest("fieldset");
+      el.style.display = "block";
+      if (fs) fs.style.display = "block";
+    });
+
+    // Calculate totals
+    totalFiles = 0;
+    totalBytes = 0;
+    for (const item of pendingUploadQueue) {
+      if (!item.isDirectory) {
+        totalFiles++;
+        totalBytes += item.file.size;
+        uploadQueue.push({ file: item.file, path: item.path });
+      }
+    }
+
+    processQueue();
+    listFiles();
   }
 </script>
 
