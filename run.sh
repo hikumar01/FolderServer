@@ -19,8 +19,5 @@ fi
 IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
 
 # Start server
-echo "Starting server on $IP:8080 (press Ctrl+C to stop)"
-echo "    Upload directory: $(pwd)/uploads"
-echo "    Maximum file size: 10GB"
-echo "    Chunk size: 8KB"
+echo "Starting server on $IP:8080..."
 python3 server.py "$IP"
