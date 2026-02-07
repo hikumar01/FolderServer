@@ -50,15 +50,22 @@ def add_security_headers(response):
 def sanitize_for_output(text):
     """
     Sanitize text for safe output in JSON responses.
-    Prevents XSS by removing potentially dangerous characters.
+    Prevents XSS by escaping HTML entities and removing control characters.
     """
     if not isinstance(text, str):
         return text
 
-    # Remove control characters and potential script injection
-    import re
+    # First, escape HTML entities to prevent XSS
+    # This escapes: < > & " ' to their HTML entity equivalents
+    sanitized = (text
+        .replace('&', '&amp;')   # Must be first!
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+        .replace('"', '&quot;')
+        .replace("'", '&#x27;'))
+
     # Remove control characters except newline, tab, carriage return
-    sanitized = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+    sanitized = ''.join(char for char in sanitized if ord(char) >= 32 or char in '\n\r\t')
 
     # Limit length to prevent DoS
     if len(sanitized) > 1000:

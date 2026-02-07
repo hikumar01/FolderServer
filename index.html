@@ -291,6 +291,13 @@
   const dropArea = document.getElementById("drop-area");
   window.addEventListener("dragover", e => e.preventDefault(), false);
   window.addEventListener("drop", e => e.preventDefault(), false);
+
+  // Helper function to escape HTML entities (XSS prevention)
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
   window.addEventListener('DOMContentLoaded', () => {
     listFiles();
   });
@@ -743,9 +750,10 @@
 
       const strategyDiv = document.createElement('div');
       strategyDiv.className = 'strategy-selector';
+      // XSS Fix: Escape conflict.path before inserting into HTML
       strategyDiv.innerHTML = `
         <label>Strategy:</label>
-        <select id="strategy_${index}" data-path="${conflict.path}">
+        <select id="strategy_${index}" data-path="${escapeHtml(conflict.path)}">
           <option value="rename">Rename</option>
           ${conflict.isDirectory ? '<option value="merge">Merge</option>' : '<option value="replace">Replace existing</option>'}
           <option value="skip">Skip</option>
@@ -893,9 +901,10 @@
 
       const strategyDiv = document.createElement('div');
       strategyDiv.className = 'strategy-selector';
+      // XSS Fix: Escape conflict.path before inserting into HTML
       strategyDiv.innerHTML = `
         <label>Action:</label>
-        <select id="file_strategy_${index}" data-path="${conflict.path}">
+        <select id="file_strategy_${index}" data-path="${escapeHtml(conflict.path)}">
           <option value="replace">Replace with new</option>
           <option value="rename">Keep both</option>
           <option value="skip">Skip</option>
