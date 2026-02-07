@@ -2,14 +2,32 @@ import os
 import signal
 import sys
 import json
+import uuid
 from flask import Flask, request, jsonify, send_from_directory
 
 UPLOAD_DIR = "./uploads"
+TMP_DIR = "./tmp"  # Separate directory for temporary upload files
 PORT = 8080
 MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB max file size
 CHUNK_SIZE = 8192  # 8KB chunks for streaming
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# Clean up any leftover temp files from previous crashes
+def cleanup_temp_files():
+    """Remove temporary files left over from interrupted uploads"""
+    try:
+        # Clean entire tmp directory - safe because it only contains our temp files
+        for filename in os.listdir(TMP_DIR):
+            temp_file = os.path.join(TMP_DIR, filename)
+            if os.path.isfile(temp_file):
+                os.remove(temp_file)
+                print(f"[CLEANUP] Removed stale temp file: {filename}")
+    except Exception as e:
+        print(f"[ERROR] Cleanup failed: {e}")
+
+cleanup_temp_files()
 
 # Flask app - single server for all file uploads
 app = Flask(__name__)
@@ -20,26 +38,51 @@ def handle_file_upload(file, relative_path):
     Common file upload handler with streaming support for large files.
     Handles versioning and duplicate detection.
     """
+    # Security: prevent empty paths
+    if not relative_path or not relative_path.strip():
+        print(f"[SECURITY] Empty path rejected")
+        return {'error': 'Empty path not allowed', 'status': 'error'}, 400
+
+    # Security: prevent null byte injection
+    if '\x00' in relative_path:
+        print(f"[SECURITY] Null byte injection blocked: {repr(relative_path)}")
+        return {'error': 'Null bytes not allowed in path', 'status': 'error'}, 400
+
     # Security: prevent path traversal
     if relative_path.startswith("/") or ".." in relative_path:
+        print(f"[SECURITY] Path traversal attempt blocked: {relative_path}")
         return {'error': 'Unsafe path', 'status': 'error'}, 400
-    
+
     filepath = os.path.abspath(os.path.join(UPLOAD_DIR, relative_path))
-    if not filepath.startswith(os.path.abspath(UPLOAD_DIR)):
+    uploads_abs = os.path.abspath(UPLOAD_DIR)
+
+    # Security: ensure filepath is strictly inside uploads directory (not equal to it)
+    if not filepath.startswith(uploads_abs + os.sep):
+        print(f"[SECURITY] Path outside upload dir blocked: {relative_path}")
         return {'error': 'Outside upload dir', 'status': 'error'}, 400
-  
+
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    # Save new file to temp location first for comparison
-    temp_path = filepath + ".tmp"
+    # Save new file to temp directory first for comparison
+    # Use UUID to prevent race conditions with concurrent uploads
+    # Store in separate tmp directory to avoid conflicts with user uploads
+    temp_filename = f"{uuid.uuid4().hex}.tmp"
+    temp_path = os.path.join(TMP_DIR, temp_filename)
 
     # Stream file to disk in chunks (memory efficient)
-    with open(temp_path, 'wb') as f:
-        while True:
-            chunk = file.stream.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            f.write(chunk)
+    try:
+        with open(temp_path, 'wb') as f:
+            while True:
+                chunk = file.stream.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:
+        # Clean up temp file on failure
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        print(f"[ERROR] Upload streaming failed for {relative_path}: {e}")
+        raise
 
     # Check if file exists and handle versioning
     if os.path.exists(filepath):
@@ -62,7 +105,7 @@ def handle_file_upload(file, relative_path):
 
         if files_identical:
             os.remove(temp_path)
-            print(f"[SKIP] Same content: {filepath}")
+            print(f"[SKIP] {relative_path} (duplicate)")
             return {'status': 'skipped', 'path': relative_path}, 200
 
         # Create versioned filename
@@ -73,12 +116,19 @@ def handle_file_upload(file, relative_path):
             versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
             counter += 1
 
+        # Security: ensure versioned file will be created inside uploads directory
+        versioned_abs = os.path.abspath(versioned_filepath)
+        if not versioned_abs.startswith(uploads_abs + os.sep):
+            os.remove(temp_path)  # Clean up temp file
+            print(f"[SECURITY] Versioned path outside upload dir blocked: {versioned_filepath}")
+            return {'error': 'Versioned file would be outside upload dir', 'status': 'error'}, 400
+
         os.rename(temp_path, versioned_filepath)
-        print(f"[UPLOAD] New version created: {versioned_filepath}")
+        print(f"[UPLOAD] {relative_path} → version ({counter-1})")
         return {'status': 'success', 'path': os.path.basename(versioned_filepath)}, 200
     else:
         os.rename(temp_path, filepath)
-        print(f"[UPLOAD] New file: {filepath}")
+        print(f"[UPLOAD] {relative_path} (new file)")
         return {'status': 'success', 'path': os.path.basename(filepath)}, 200
 
 @app.route('/', methods=['GET', 'POST'])
@@ -92,7 +142,7 @@ def handle_request():
         # Handle file upload (both small and large files)
         if 'file' not in request.files:
             return jsonify({'error': 'No file part', 'status': 'error'}), 400
-        
+
         file = request.files['file']
         if file.filename == '':
             return jsonify({'error': 'No selected file', 'status': 'error'}), 400

@@ -85,7 +85,7 @@ python3 -m venv venv && source venv/bin/activate && pip install -r requirements.
 
 ## Architecture
 
-Single Flask server on port 8080. Streams uploads in 8KB chunks to avoid loading large files into memory. Constant ~8KB RAM usage regardless of file size.
+Single Flask server on port 8080. Streams uploads in 8KB chunks to avoid loading large files into memory. Memory-efficient with ~8KB buffer (independent of file size).
 
 ## License
 

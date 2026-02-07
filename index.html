@@ -167,7 +167,7 @@
     if (items && items.length > 0 && items[0].webkitGetAsEntry) {
       const entries = [];
       for (const item of items) {
-        const entry = item.webkitGetAsEntry();
+        const entry = item.webkitGetAsEntry?.();
         if (entry) entries.push(entry);
       }
       
