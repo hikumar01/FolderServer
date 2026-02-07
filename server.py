@@ -33,34 +33,122 @@ cleanup_temp_files()
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
-def handle_file_upload(file, relative_path):
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses"""
+    # Prevent MIME type sniffing
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    # Prevent clickjacking
+    response.headers['X-Frame-Options'] = 'DENY'
+    # Enable XSS protection in browsers
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    # Ensure proper content type for JSON responses
+    if response.content_type and 'application/json' in response.content_type:
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+    return response
+
+def sanitize_for_output(text):
     """
-    Common file upload handler with streaming support for large files.
-    Handles versioning and duplicate detection.
+    Sanitize text for safe output in JSON responses.
+    Prevents XSS by removing potentially dangerous characters.
+    """
+    if not isinstance(text, str):
+        return text
+
+    # Remove control characters and potential script injection
+    import re
+    # Remove control characters except newline, tab, carriage return
+    sanitized = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+
+    # Limit length to prevent DoS
+    if len(sanitized) > 1000:
+        sanitized = sanitized[:1000]
+
+    return sanitized
+
+def validate_path(relative_path):
+    """
+    Validate and sanitize relative path for security.
+    Returns (is_valid, sanitized_path, error_message)
     """
     # Security: prevent empty paths
     if not relative_path or not relative_path.strip():
         print(f"[SECURITY] Empty path rejected")
-        return {'error': 'Empty path not allowed', 'status': 'error'}, 400
+        return False, None, 'Empty path not allowed'
 
     # Security: prevent null byte injection
     if '\x00' in relative_path:
         print(f"[SECURITY] Null byte injection blocked: {repr(relative_path)}")
-        return {'error': 'Null bytes not allowed in path', 'status': 'error'}, 400
+        return False, None, 'Null bytes not allowed in path'
 
     # Security: prevent path traversal
     if relative_path.startswith("/") or ".." in relative_path:
         print(f"[SECURITY] Path traversal attempt blocked: {relative_path}")
-        return {'error': 'Unsafe path', 'status': 'error'}, 400
+        return False, None, 'Unsafe path'
 
     filepath = os.path.abspath(os.path.join(UPLOAD_DIR, relative_path))
     uploads_abs = os.path.abspath(UPLOAD_DIR)
 
-    # Security: ensure filepath is strictly inside uploads directory (not equal to it)
+    # Security: ensure filepath is strictly inside uploads directory
     if not filepath.startswith(uploads_abs + os.sep):
-        print(f"[SECURITY] Path outside upload dir blocked: {relative_path}")
-        return {'error': 'Outside upload dir', 'status': 'error'}, 400
+        return False, None, 'Outside upload dir'
 
+    return True, filepath, None
+
+def files_are_identical(file1_path, file2_path):
+    """Compare two files chunk by chunk to check if they're identical"""
+    try:
+        # Quick size check first - avoid expensive byte comparison if sizes differ
+        size1 = os.path.getsize(file1_path)
+        size2 = os.path.getsize(file2_path)
+        if size1 != size2:
+            return False
+
+        # Byte-by-byte comparison
+        with open(file1_path, 'rb') as f1, open(file2_path, 'rb') as f2:
+            while True:
+                chunk1 = f1.read(CHUNK_SIZE)
+                chunk2 = f2.read(CHUNK_SIZE)
+                if chunk1 != chunk2:
+                    return False
+                if not chunk1:  # End of file
+                    return True
+    except Exception as e:
+        print(f"[ERROR] File comparison failed: {e}")
+        return False
+
+def get_versioned_filepath(filepath):
+    """Generate a versioned filename if the file already exists"""
+    if not os.path.exists(filepath):
+        return filepath, 0
+
+    base, ext = os.path.splitext(filepath)
+    counter = 1
+    versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
+
+    while os.path.exists(versioned_filepath):
+        counter += 1
+        versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
+
+    return versioned_filepath, counter
+
+def handle_file_upload(file, relative_path, strategy='rename'):
+    """
+    Common file upload handler with streaming support for large files.
+    Handles versioning and duplicate detection.
+
+    Args:
+        file: The file object to upload
+        relative_path: The relative path where to save the file
+        strategy: How to handle conflicts - 'merge', 'replace', 'rename', 'skip'
+    """
+    # Validate path
+    is_valid, filepath, error = validate_path(relative_path)
+    if not is_valid:
+        print(f"[SECURITY] {error}: {relative_path}")
+        return {'error': error, 'status': 'error'}, 400
+
+    uploads_abs = os.path.abspath(UPLOAD_DIR)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
     # Save new file to temp directory first for comparison
@@ -79,42 +167,44 @@ def handle_file_upload(file, relative_path):
                 f.write(chunk)
     except Exception as e:
         # Clean up temp file on failure
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except:
+            pass  # Best effort cleanup
         print(f"[ERROR] Upload streaming failed for {relative_path}: {e}")
         raise
 
-    # Check if file exists and handle versioning
-    if os.path.exists(filepath):
-        # Compare files using chunks to avoid loading large files into memory
-        files_identical = False
-        try:
-            with open(temp_path, 'rb') as new_file, open(filepath, 'rb') as existing_file:
-                files_identical = True
-                while True:
-                    new_chunk = new_file.read(CHUNK_SIZE)
-                    existing_chunk = existing_file.read(CHUNK_SIZE)
-                    if new_chunk != existing_chunk:
-                        files_identical = False
-                        break
-                    if not new_chunk:  # End of file
-                        break
-        except Exception as e:
-            print(f"[ERROR] Comparison failed: {e}")
-            files_identical = False
+    # Check if file exists and handle based on strategy
+    if not os.path.exists(filepath):
+        # New file - no conflict
+        os.rename(temp_path, filepath)
+        print(f"[UPLOAD] {relative_path} (new file)")
+        return {'status': 'success', 'path': sanitize_for_output(os.path.basename(filepath)), 'action': 'new'}, 200
 
-        if files_identical:
-            os.remove(temp_path)
-            print(f"[SKIP] {relative_path} (duplicate)")
-            return {'status': 'skipped', 'path': relative_path}, 200
+    # File exists - check if identical first (fast path for duplicates)
+    if files_are_identical(temp_path, filepath):
+        os.remove(temp_path)
+        print(f"[SKIP] {relative_path} (duplicate)")
+        return {'status': 'skipped', 'path': sanitize_for_output(relative_path), 'reason': 'identical'}, 200
 
+    # Handle based on strategy
+    if strategy == 'skip':
+        os.remove(temp_path)
+        print(f"[SKIP] {relative_path} (user choice)")
+        return {'status': 'skipped', 'path': sanitize_for_output(relative_path), 'reason': 'user_skip'}, 200
+
+    elif strategy in ('replace', 'merge'):
+        # For files, merge means replace (merge only applies to directories conceptually)
+        os.remove(filepath)
+        os.rename(temp_path, filepath)
+        action = 'replaced' if strategy == 'replace' else 'merged'
+        print(f"[{strategy.upper()}] {relative_path}")
+        return {'status': 'success', 'path': sanitize_for_output(os.path.basename(filepath)), 'action': action}, 200
+
+    else:  # strategy == 'rename' (default)
         # Create versioned filename
-        base, ext = os.path.splitext(filepath)
-        counter = 1
-        versioned_filepath = filepath
-        while os.path.exists(versioned_filepath):
-            versioned_filepath = f"{base} ({counter}){ext}" if ext else f"{base} ({counter})"
-            counter += 1
+        versioned_filepath, version = get_versioned_filepath(filepath)
 
         # Security: ensure versioned file will be created inside uploads directory
         versioned_abs = os.path.abspath(versioned_filepath)
@@ -124,12 +214,8 @@ def handle_file_upload(file, relative_path):
             return {'error': 'Versioned file would be outside upload dir', 'status': 'error'}, 400
 
         os.rename(temp_path, versioned_filepath)
-        print(f"[UPLOAD] {relative_path} → version ({counter-1})")
-        return {'status': 'success', 'path': os.path.basename(versioned_filepath)}, 200
-    else:
-        os.rename(temp_path, filepath)
-        print(f"[UPLOAD] {relative_path} (new file)")
-        return {'status': 'success', 'path': os.path.basename(filepath)}, 200
+        print(f"[UPLOAD] {relative_path} → version ({version})")
+        return {'status': 'success', 'path': sanitize_for_output(os.path.basename(versioned_filepath)), 'action': 'renamed'}, 200
 
 @app.route('/', methods=['GET', 'POST'])
 def handle_request():
@@ -149,36 +235,88 @@ def handle_request():
 
         # Get the relative path from form data (multipart) or use filename
         relative_path = request.form.get('path', file.filename)
+        strategy = request.form.get('strategy', 'rename')
+
+        # Sanitize strategy input (whitelist approach)
+        if strategy not in ['rename', 'replace', 'merge', 'skip']:
+            strategy = 'rename'
 
         try:
-            result, status_code = handle_file_upload(file, relative_path)
+            result, status_code = handle_file_upload(file, relative_path, strategy)
             return jsonify(result), status_code
         except Exception as e:
-            print(f"[ERROR] Upload failed: {e}")
-            return jsonify({'error': str(e), 'status': 'error'}), 500
+            # Log detailed error server-side only
+            print(f"[ERROR] Upload failed for {relative_path}: {type(e).__name__}: {e}")
+            # Return generic error to client (no sensitive information)
+            return jsonify({'error': 'Upload failed', 'status': 'error'}), 500
+
+@app.route('/check-file-conflicts', methods=['POST'])
+def check_file_conflicts():
+    """
+    Check for file-level conflicts within directories being merged.
+    Returns list of files that exist with their sizes for comparison.
+    """
+    try:
+        data = request.get_json()
+        if not data or 'paths' not in data:
+            return jsonify({'error': 'No paths provided'}), 400
+
+        paths_to_check = data['paths']  # List of relative file paths
+        conflicts = []
+        uploads_abs = os.path.abspath(UPLOAD_DIR)
+
+        for relative_path in paths_to_check:
+            # Validate path
+            is_valid, filepath, error = validate_path(relative_path)
+            if not is_valid:
+                continue
+
+            # Check if file exists
+            if os.path.exists(filepath) and os.path.isfile(filepath):
+                conflicts.append({
+                    'path': sanitize_for_output(relative_path),
+                    'existingSize': os.path.getsize(filepath)
+                })
+
+        return jsonify({'conflicts': conflicts}), 200
+    except Exception as e:
+        print(f"[ERROR] File conflict check failed: {type(e).__name__}: {e}")
+        return jsonify({'error': 'Failed to check file conflicts'}), 500
 
 @app.route('/list', methods=['GET'])
 def list_files():
-    """List uploaded files"""
+    """List uploaded files with caching headers for performance"""
     uploads_abs = os.path.abspath(UPLOAD_DIR)
     result = []
 
     try:
         for entry in os.listdir(uploads_abs):
             full_path = os.path.join(uploads_abs, entry)
+            # Sanitize entry names to prevent XSS
+            sanitized_entry = sanitize_for_output(entry)
+
             if os.path.isdir(full_path):
                 result.append({
-                    "path": entry + "/",
+                    "path": sanitized_entry + "/",
                     "size": 0
                 })
             elif os.path.isfile(full_path):
                 result.append({
-                    "path": entry,
+                    "path": sanitized_entry,
                     "size": os.path.getsize(full_path)
                 })
-        return jsonify(result), 200
+
+        response = jsonify(result)
+        # Disable caching to ensure immediate updates after uploads
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response, 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Log detailed error server-side only
+        print(f"[ERROR] List files failed: {type(e).__name__}: {e}")
+        # Return generic error to client
+        return jsonify({'error': 'Failed to retrieve file list'}), 500
 
 @app.route('/<path:filename>')
 def serve_static(filename):
