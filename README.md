@@ -5,8 +5,6 @@ Flask-based file upload server with streaming support for files up to 10GB.
 ## Requirements
 
 - Python 3.6+
-- Flask 3.0+
-- Werkzeug 3.0+
 
 ## Setup (First Time)
 
@@ -70,9 +68,9 @@ curl http://localhost:8080/list
 
 ## Troubleshooting
 
-**Flask not installed:**
+**Flask or dependencies not installed:**
 ```bash
-pip3 install Flask Werkzeug
+pip install -r requirements.txt
 ```
 
 **Port 8080 busy:**
